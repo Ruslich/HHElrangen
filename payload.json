@@ -1,0 +1,4 @@
+﻿{
+  "modelId": "arn:aws:bedrock:eu-central-1:379495554207:inference-profile/eu.amazon.nova-lite-v1:0",
+  "messages": [{"role":"user","content":[{"text":"Say hi in 5 words"}]}]
+}
