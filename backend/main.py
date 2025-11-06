@@ -1,3 +1,6 @@
+import re
+from hashlib import md5
+
 from dotenv import load_dotenv
 
 load_dotenv(".env.local"); load_dotenv()  # also loads .env if present
@@ -5,6 +8,7 @@ load_dotenv(".env.local"); load_dotenv()  # also loads .env if present
 import os  # noqa: E402
 from typing import Optional  # noqa: E402
 
+from cachetools import TTLCache
 from fastapi import Body, FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
@@ -30,6 +34,9 @@ app.add_middleware(
 
 BUCKET = os.getenv("DATA_BUCKET", "health-demo-hherlangen")
 PREFIX = os.getenv("DATA_PREFIX", "data/")
+
+SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))  # 1 hour default
+SESSIONS = TTLCache(maxsize=500, ttl=SESSION_TTL)
 
 @app.get("/hello")
 def read_root():
@@ -76,6 +83,83 @@ class AnalyzeRequest(BaseModel):
     agg: str = "mean"                 # one of: mean,sum,count,median
     limit: int = 6                    # top-N groups to show if grouped
     use_ai: Optional[bool] = None  # if provided, overrides BEDROCK_ENABLED for this request
+
+
+
+# --- Bedrock helpers (model selection, review/fix, limits) ---
+
+def _pick_sql_model_id() -> str:
+    """
+    Choose which model generates SQL.
+    - If NLQ_FORCE_PRO=true -> always Pro
+    - Else: start with Lite for simple intents, escalate on failure
+    """
+    use_pro = os.getenv("NLQ_FORCE_PRO", "true").lower() == "true"
+    return os.getenv("BEDROCK_PRO_MODEL_ID", "amazon.nova-pro-v1:0") if use_pro \
+           else os.getenv("BEDROCK_LITE_MODEL_ID", "amazon.nova-lite-v1:0")
+
+def _bedrock_converse(model_id: str, system_text: str, user_text: str,
+                      max_tokens: int | None = None, temperature: float | None = None) -> str:
+    import boto3
+    from botocore.config import Config
+    cfg = Config(region_name=os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "eu-central-1")),
+                 read_timeout=12, connect_timeout=3)
+    brt = boto3.client("bedrock-runtime", config=cfg)
+    resp = brt.converse(
+        modelId=model_id,
+        system=[{"text": system_text}],
+        messages=[{"role": "user", "content": [{"text": user_text}]}],
+        inferenceConfig={
+            "maxTokens": int(os.getenv("NLQ_MAX_TOKENS", max_tokens or 220)),
+            "temperature": float(os.getenv("NLQ_TEMPERATURE", temperature or 0.1)),
+            "topP": 0.9
+        },
+    )
+    parts = resp.get("output", {}).get("message", {}).get("content", [])
+    return (parts[0].get("text", "") if parts else "").strip()
+
+def _normalize_sql_fences(sql: str) -> str:
+    import re
+    sql = re.sub(r"^```(?:\w+)?\s*", "", sql, flags=re.IGNORECASE).strip()
+    sql = re.sub(r"\s*```$", "", sql).strip()
+    sql = re.sub(r"^\s*sql\s*:\s*", "", sql, flags=re.IGNORECASE).strip()
+    return sql[:-1].strip() if sql.endswith(";") else sql
+
+def _enforce_row_limit(sql: str, default_limit: int) -> str:
+    """Append LIMIT if the query seems unbounded."""
+    import re
+    if re.search(r'\blimit\s+\d+\b', sql, flags=re.I):
+        return sql
+    # Only add when there's no aggregation limit pattern already
+    return sql.rstrip() + f" LIMIT {max(1, default_limit)}"
+
+def _review_and_fix_sql(question: str, sql: str, error: str | None = None) -> str:
+    """
+    Ask the model (Pro) to check if SQL answers the NL question.
+    If not, or if there was an execution error, return a corrected SQL.
+    """
+    system = "You are a senior data engineer. Output ONLY a valid Athena SQL SELECT, nothing else."
+    critique = (
+        "User question:\n"
+        f"{question}\n\n"
+        "Candidate SQL:\n"
+        f"{sql}\n\n"
+        "If the SQL does not answer the question or caused an error, fix it. "
+        "Rules:\n"
+        "- Use exact column/table names from the provided schema snapshot in the SQL prompt.\n"
+        "- If the user asks 'Top/Most' of X among Y with condition Z, group by X and filter Z in WHERE, "
+        "  ORDER BY COUNT(*) DESC and LIMIT N.\n"
+        "- Use LOWER(...) for case-insensitive text filters.\n"
+        "- Quote identifiers with spaces using double quotes."
+    )
+    if error:
+        critique += f"\n\nExecution error to avoid next time:\n{error}\n"
+
+    model_id = os.getenv("BEDROCK_PRO_MODEL_ID", "amazon.nova-pro-v1:0")
+    fixed = _bedrock_converse(model_id, system, critique)
+    return _normalize_sql_fences(fixed)
+
+
 
 
 # Add a planning request model
@@ -441,71 +525,445 @@ class NLQRequest(BaseModel):
     # optional guardrails
     max_rows: int = 1000
 
-def _build_sql_prompt(question: str) -> str:
-    schema = get_table_summaries()
-    allow = ", ".join(sorted(os.getenv("ALLOWED_TABLES", "").split(",")))
+
+def _make_text_filters_case_insensitive(sql: str) -> str:
+    """
+    Rewrite WHERE ... = 'text' and WHERE ... LIKE 'text'
+    to be case-insensitive using LOWER(...).
+    """
+    # protect string literals
+    parts = re.split(r'(\"[^\"]*\"|\'.*?\')', sql)
+
+    def wrap_col(m):
+        col = m.group("col")
+        val = m.group("val")
+        return f"LOWER({col}) LIKE LOWER({val})"
+
+    for i in range(0, len(parts), 2):  # only outside quoted strings
+        # = 'text'  ->  LIKE
+        parts[i] = re.sub(
+            r"(?P<col>\"[^\"]+\"|\w+(?:\.\w+)?)[ \t]*=[ \t]*(?P<val>'[^']*')",
+            wrap_col,
+            parts[i],
+            flags=re.IGNORECASE
+        )
+        # LIKE 'text' -> LOWER(col) LIKE LOWER('text')
+        parts[i] = re.sub(
+            r"(?P<col>\"[^\"]+\"|\w+(?:\.\w+)?)[ \t]+LIKE[ \t]+(?P<val>'[^']*')",
+            wrap_col,
+            parts[i],
+            flags=re.IGNORECASE
+        )
+    return "".join(parts)
+
+
+def _build_sql_prompt(question: str, prev_sql: str | None = None) -> str:
+    """
+    Build a schema-aware prompt using the *current* Glue/Athena schema.
+    - Picks column names dynamically (medication/condition/billing/gender/etc)
+    - Generates 1–3 short examples only with columns that actually exist
+    - Instructs the model to quote names with spaces and use case-insensitive filters
+    """
+    schema = get_table_summaries()  # {table: [(col, type), ...]}
+    allowed = [t.strip() for t in os.getenv("ALLOWED_TABLES", "").split(",") if t.strip()]
+
+    # choose the table we will reference in examples
+    table = None
+    if allowed:
+        for t in allowed:
+            if t in schema:
+                table = t
+                break
+    if not table and schema:
+        table = next(iter(schema.keys()))  # first available
+
+    cols = schema.get(table, [])
+    colnames = [c for c, _ in cols]
+
+    # helpers to pick best matching column from synonyms
+    def _norm(s: str) -> str:
+        return s.lower().strip()
+
+    lc_map = {_norm(c): c for c in colnames}
+    squish_map = {re.sub(r"[\s_]", "", c.lower()): c for c in colnames}
+
+    def pick(*candidates):
+        # exact (case-insensitive)
+        for k in candidates:
+            k2 = _norm(k)
+            if k2 in lc_map:
+                return lc_map[k2]
+        # fuzzy (ignore spaces/underscores)
+        for k in candidates:
+            k2 = re.sub(r"[\s_]", "", k.lower())
+            if k2 in squish_map:
+                return squish_map[k2]
+        return None
+
+    # try to identify common roles from your dataset
+    COL_GENDER     = pick("Gender", "Sex")
+    COL_BILLING    = pick("Billing Amount", "Billing", "Cost", "Charge", "Amount")
+    COL_CONDITION  = pick("Medical Condition", "Diagnosis", "Condition")
+    COL_MEDICATION = pick("Medication", "Drug", "Medicine", "Prescription")
+    COL_HOSPITAL   = pick("Hospital", "Facility", "Clinic")
+
+    db = os.getenv("ATHENA_DATABASE", "default")
+
+    # examples: only include when all required columns are found
+    examples = []
+    if table and COL_GENDER and COL_BILLING:
+        examples.append(
+            f'SELECT "{COL_GENDER}", AVG(CAST("{COL_BILLING}" AS double)) AS avg_billing '
+            f'FROM {db}.{table} '
+            f'GROUP BY "{COL_GENDER}" '
+            f'ORDER BY avg_billing DESC;'
+        )
+
+    if table and COL_MEDICATION and COL_CONDITION:
+        examples.append(
+            f'SELECT "{COL_MEDICATION}", COUNT(*) AS frequency '
+            f'FROM {db}.{table} '
+            f'WHERE LOWER("{COL_CONDITION}") LIKE ''%asthma%'' '
+            f'GROUP BY "{COL_MEDICATION}" '
+            f'ORDER BY frequency DESC '
+            f'LIMIT 1;'
+        )
+
+    if table and COL_HOSPITAL:
+        examples.append(
+            f'SELECT "{COL_HOSPITAL}", COUNT(*) AS frequency '
+            f'FROM {db}.{table} '
+            f'GROUP BY "{COL_HOSPITAL}" '
+            f'ORDER BY frequency DESC '
+            f'LIMIT 3;'
+        )
+
+    if table:
+        examples.append(
+            f'SELECT "medication", COUNT(*) AS frequency '
+            f'FROM {db}.{table} '
+            f'WHERE LOWER("medical condition") LIKE ''%diabetes%'' '
+            f'GROUP BY "medication" '
+            f'ORDER BY frequency DESC LIMIT 5;'
+        )
+
+    # include a short, current schema view (only the chosen table for brevity)
     schema_lines = []
-    for t, cols in schema.items():
-        cols_str = ", ".join([f"{c}:{typ}" for c, typ in cols])
-        schema_lines.append(f"- {t}: {cols_str}")
-    return (
-        "You are a clinical analytics SQL generator for Amazon Athena (Presto/Trino dialect). "
-        "Return ONLY a single SELECT statement. No comments, no backticks. "
-        f"Database: {os.getenv('ATHENA_DATABASE')}. "
-        f"Allowed tables: {allow or '(any)'}.\n"
-        "Schema (first few columns per table):\n"
-        + "\n".join(schema_lines)
-        + "\n\nQuestion: " + question
-        + "\nRules: Prefer COUNT, GROUP BY for frequencies; use CAST as needed; "
-          "if asking for 'most frequent', ORDER BY count desc LIMIT 1; for time trends, group by date truncs."
+    if table:
+        preview = ", ".join([f'{c}:{t}' for c, t in cols[:15]])
+        schema_lines.append(f"- {table}: {preview}")
+
+    allow_text = ", ".join(allowed) if allowed else "(any)"
+
+    # deterministic hash of the schema we used (handy to debug/calc size)
+    schema_hash = md5(("|".join([table or ""] + colnames)).encode()).hexdigest()
+
+    # final prompt (lean + prescriptive)
+    prompt = (
+        "You are a clinical analytics SQL generator for Amazon Athena (Trino/Presto).\n"
+        "Return ONLY one SELECT statement. No comments, no backticks.\n"
+        f"Database: {db}.   Allowed tables: {allow_text}.   Schema hash: {schema_hash}\n"
+        "Schema:\n" + ("\n".join(schema_lines) if schema_lines else "- (no schema)") + "\n\n"
+        "Rules:\n"
+        "- Use table and column NAMES EXACTLY as shown. If a name has spaces/mixed case, wrap it in double quotes (e.g., \"Billing Amount\").\n"
+        "- Prefer fully qualified FROM {db}.{table}. Use LOWER(col) for case-insensitive text filters.\n"
+        "- For 'most popular' or 'most frequent', GROUP BY the target and ORDER BY COUNT(*) DESC LIMIT N.\n"
+        "- CAST to double when averaging/summing text numeric columns.\n\n"
     )
 
-@app.post("/nlq")
-def nlq(req: NLQRequest):
-    # 1) Ask Bedrock for SQL
+    if examples:
+        prompt += "Examples:\n" + "\n".join(examples) + "\n\n"
+
+    prompt += "Question: " + question + "\n"
+
+    if prev_sql:
+        prompt += (
+            "\nPrior SQL (context – update or extend if needed, do not merely repeat):\n"
+            f"{prev_sql}\n"
+        )
+    return prompt
+
+
+def _pick_col(schema_cols, *candidates):
+    # schema_cols is a list like ['Name','Age',...]
+    lc = {c.lower(): c for c in schema_cols}
+    squish = {re.sub(r'[\s_]', '', c.lower()): c for c in schema_cols}
+    for k in candidates:
+        if k.lower() in lc:
+            return lc[k.lower()]
+    for k in candidates:
+        kk = re.sub(r'[\s_]', '', k.lower())
+        if kk in squish:
+            return squish[kk]
+    return None
+
+
+def _semantic_sql_adjust(question: str, sql: str) -> str:
+    import re
+    summaries = get_table_summaries()
+    allowed = [t.strip() for t in os.getenv("ALLOWED_TABLES", "").split(",") if t.strip()]
+    table = next((t for t in allowed if t in summaries), (next(iter(summaries)) if summaries else None))
+    cols = [c for c, _ in (summaries.get(table) or [])]
+
+    # 1) find columns
+    col_med   = _pick_col(cols, "Medication", "Medications", "Drug", "Drugs", "Medicine", "Prescription", "Medication Name", "Drug Name")
+    col_cond  = _pick_col(cols, "Medical Condition", "Diagnosis", "Condition")
+
+    # 2) robust intent (plurals + slang)
+    q = (question or "").lower()
+    wants_med = any(k in q for k in ["medication", "medications", "drug", "drugs", "medicine", "meds"])
+    if not wants_med or not col_med:
+        return sql
+
+    # 3) determine N
+    m = re.search(r'\btop\s+(\d+)', q)
+    top_n = int(m.group(1)) if m else (1 if any(k in q for k in ["most", "top", "popular"]) else 5)
+
+    # 4) if grouped by condition, flip to medication
+    if re.search(r'group\s+by\s+"?medical condition"?', sql, flags=re.I) or \
+       (col_cond and re.search(fr'group\s+by\s+"?{re.escape(col_cond)}"?', sql, flags=re.I)):
+        sql = re.sub(r'SELECT\s+.*?\s+FROM', f'SELECT "{col_med}", COUNT(*) AS frequency FROM', sql, flags=re.I|re.S)
+        sql = re.sub(r'GROUP\s+BY\s+.*?(ORDER|LIMIT|$)', f'GROUP BY "{col_med}" \\1', sql, flags=re.I|re.S)
+
+    # 5) ensure ORDER BY count desc
+    if not re.search(r'order\s+by\s+count\s*\(\s*\*\s*\)\s*desc', sql, flags=re.I):
+        sql = re.sub(r'(GROUP\s+BY\s+[^;]+)', r'\1 ORDER BY COUNT(*) DESC', sql, flags=re.I)
+
+    # 6) ensure LIMIT N
+    if re.search(r'\blimit\s+\d+', sql, flags=re.I):
+        sql = re.sub(r'\blimit\s+\d+', f'LIMIT {top_n}', sql, flags=re.I)
+    else:
+        sql = sql.rstrip() + f' LIMIT {top_n}'
+
+    # 7) replace guessed identifiers with the exact ones we found
+    sql = re.sub(r'\bmedication(s)?\b', f'"{col_med}"', sql, flags=re.I)
+    if col_cond:
+        sql = re.sub(r'"?medical condition"?', f'"{col_cond}"', sql, flags=re.I)
+
+    return sql
+
+def _counts_summary_from_df(df, sql: str) -> str | None:
+    """
+    If the query result looks like: <group_col>, <count_col> (e.g., gender + frequency),
+    return a short sentence: 'Among N records [with X filter]: Female: 51.2% (2777), Male: 48.8% (2643).'
+    Otherwise return None.
+    """
     import re
 
-    import boto3
-    from botocore.config import Config
+    import pandas as pd
 
+    if df is None or df.empty or len(df.columns) < 2:
+        return None
+
+    # Pick a count column
+    def is_numeric(col):
+        return pd.to_numeric(df[col], errors="coerce").notna().mean() > 0.95
+
+    # Prefer common names first, else first numeric col
+    preferred = [c for c in df.columns if c.lower() in ("frequency","count","cnt","n","total")]
+    count_col = next((c for c in preferred if c in df.columns and is_numeric(c)), None)
+    if not count_col:
+        numeric_cols = [c for c in df.columns if is_numeric(c)]
+        if not numeric_cols:
+            return None
+        count_col = numeric_cols[0]
+
+    # Group column = first non-numeric column different from count
+    group_col = next((c for c in df.columns if c != count_col and not is_numeric(c)), None)
+    if not group_col:
+        # fallback: any other column
+        candidates = [c for c in df.columns if c != count_col]
+        group_col = candidates[0] if candidates else None
+    if not group_col:
+        return None
+
+    # Clean + compute totals/percentages
+    d = df[[group_col, count_col]].copy()
+    d[count_col] = pd.to_numeric(d[count_col], errors="coerce").fillna(0)
+    total = float(d[count_col].sum())
+    if total <= 0:
+        return None
+
+    # Extract an English-y filter from SQL, e.g. LOWER("medical condition") LIKE LOWER('%diabetes%')
+    filt_text = None
+    try:
+        m = re.search(r'where\s+(.+?)\s+(group|order|limit|$)', sql, flags=re.I|re.S)
+        if m:
+            where_block = m.group(1)
+            m2 = re.search(r'lower\("([^"]+)"\)\s+like\s+lower\(''%?([^'']+)%?''\)', where_block, flags=re.I)
+            if m2:
+                filt_text = f'{m2.group(1)} containing "{m2.group(2)}"'
+            else:
+                # catch simple equals too
+                m3 = re.search(r'lower\("([^"]+)"\)\s*=\s*''([^'']+)''', where_block, flags=re.I)
+                if m3:
+                    filt_text = f'{m3.group(1)} = "{m3.group(2)}"'
+    except Exception:
+        pass
+
+    # Build parts
+    parts = []
+    for _, r in d.iterrows():
+        n = int(r[count_col])
+        p = (r[count_col] / total) * 100.0
+        parts.append(f'{r[group_col]}: {n} ({p:.1f}%)')
+
+    head = f'Among {int(total)} records'
+    if filt_text:
+        head += f' with {filt_text}'
+    return head + ': ' + "; ".join(parts) + '.'
+
+
+
+@app.post("/nlq")
+def nlq(req: NLQRequest, prev_sql: str | None = None):
     if os.getenv("BEDROCK_ENABLED", "false").lower() != "true":
         raise HTTPException(status_code=400, detail="Bedrock disabled for NLQ")
 
-    prompt = _build_sql_prompt(req.question)
-    cfg = Config(region_name=os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "eu-central-1")),
-                 read_timeout=10, connect_timeout=3)
-    brt = boto3.client("bedrock-runtime", config=cfg)
-    resp = brt.converse(
-        modelId=os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0"),
-        system=[{"text": "Answer with valid Athena SQL only."}],
-        messages=[{"role":"user","content":[{"text":prompt}]}],
-        inferenceConfig={"maxTokens": 220, "temperature": float(os.getenv("BEDROCK_TEMPERATURE","0.2"))}
+    # 1) Build prescriptive, schema-aware prompt
+    prompt = _build_sql_prompt(req.question, prev_sql)
+
+    # 2) Generate SQL (Lite or Pro based on env)
+    model_for_sql = _pick_sql_model_id()
+    sql_raw = _bedrock_converse(
+        model_for_sql,
+        system_text="Answer with valid Athena SQL only.",
+        user_text=prompt,
     )
-    sql = resp["output"]["message"]["content"][0]["text"].strip()
+    sql = _normalize_sql_fences(sql_raw)
 
-    # --- normalize fences / prefixes / trailing semicolon
-    sql = re.sub(r"^```(?:\w+)?\s*", "", sql, flags=re.IGNORECASE).strip()
-    sql = re.sub(r"\s*```$", "", sql).strip()
-    sql = re.sub(r"^\s*sql\s*:\s*", "", sql, flags=re.IGNORECASE).strip()
-    if sql.endswith(";"):
-        sql = sql[:-1].strip()
+    # 3) Post-processing: case-insensitive text + task-specific fixes
+    sql = _make_text_filters_case_insensitive(sql)
 
-    # 2) Safety check
+    # DEBUG: did we rewrite for medication frequency?
+    before = sql
+    sql = _semantic_sql_adjust(req.question, sql)
+    rewrote_medication = (sql != before)
+
+    # 3b) Safety + LIMIT
+    sql = _enforce_row_limit(sql, int(os.getenv("NLQ_DEFAULT_LIMIT", str(req.max_rows or 1000))))
     if not is_sql_safe(sql):
-        raise HTTPException(status_code=400, detail=f"Unsafe or unsupported SQL generated: {sql}")
+        # Try one repair pass if unsafe
+        sql = _review_and_fix_sql(req.question, sql, error="Rejected by safety rules")
+        sql = _make_text_filters_case_insensitive(sql)
+        sql = _semantic_sql_adjust(req.question, sql)
+        sql = _enforce_row_limit(sql, int(os.getenv("NLQ_DEFAULT_LIMIT", str(req.max_rows or 1000))))
+        if not is_sql_safe(sql):
+            raise HTTPException(status_code=400, detail=f"Unsafe SQL after repair: {sql}")
 
-    # 3) Execute
+    # 4) Execute with one self-heal retry on Athena error
     try:
         df = athena_sql_to_df(sql)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Athena error: {e}")
+    except Exception as e1:
+        # One repair pass with the execution error and then retry
+        repaired = _review_and_fix_sql(req.question, sql, error=str(e1))
+        repaired = _make_text_filters_case_insensitive(repaired)
+        repaired = _semantic_sql_adjust(req.question, repaired)
+        repaired = _enforce_row_limit(repaired, int(os.getenv("NLQ_DEFAULT_LIMIT", str(req.max_rows or 1000))))
+        if not is_sql_safe(repaired):
+            raise HTTPException(status_code=500, detail=f"Athena error: {e1}. Also produced unsafe repair: {repaired}")
+        try:
+            df = athena_sql_to_df(repaired)
+            sql = repaired  # use the fixed version going forward
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Athena error: {e2}. Original: {e1}. SQL: {sql}")
 
-    # 4) Pick a chart + summary
+    # 5) Visualization + summary (unchanged)
     chart = suggest_chart(df)
     preview = df.head(50).to_dict(orient="records")
 
-    summary = _summarize_with_bedrock(
+    smart_summary = _counts_summary_from_df(df, sql)
+    summary = smart_summary or _summarize_with_bedrock(
         {"question": req.question, "sql": sql, "columns": list(df.columns)[:6], "rows": len(df)}
     )
 
-    return {"sql": sql, "chart": chart, "rows": preview, "columns": list(df.columns), "summary": summary}
+    return {
+        "sql": sql,
+        "chart": chart,
+        "rows": preview,
+        "columns": list(df.columns),
+        "summary": summary,
+        "model_used": model_for_sql,           # <<< added
+        "medication_rewrite": rewrote_medication  # <<< added
+    }
+
+
+
+class ChatRequest(BaseModel):
+    text: str
+    max_rows: int = 1000
+    history: list[dict] = []          # NEW: [{"role":"user"|"assistant", "content": "..."}]
+    session_id: str | None = None     # NEW
+    context: dict | None = None       # NEW: {"last_sql": "...", "columns": [...]}
+
+
+
+# very small intent heuristic: treat messages with analytic cues as data questions
+_ANALYTICS_HINTS = re.compile(
+    r"\b(compare|trend|over time|average|mean|sum|count|median|which|most|top|by\s+\w+|chart|plot|vs|per|group by)\b",
+    re.I,
+)
+
+def detect_intent(text: str) -> str:
+    return "data" if _ANALYTICS_HINTS.search(text or "") else "chitchat"
+
+def _smalltalk_reply(text: str, history: list[dict]) -> str:
+    if os.getenv("BEDROCK_ENABLED", "false").lower() == "true":
+        import boto3
+        from botocore.config import Config
+        brt = boto3.client("bedrock-runtime", config=Config(
+            region_name=os.getenv("BEDROCK_REGION", os.getenv("AWS_REGION", "eu-central-1")),
+            read_timeout=6, connect_timeout=3,
+        ))
+
+        # Build a short message list: system + last few turns + current user
+        msgs = []
+        for h in history[-6:]:
+            role = "user" if h.get("role") == "user" else "assistant"
+            if h.get("content"):
+                msgs.append({"role": role, "content": [{"text": h["content"]}]})
+        msgs.append({"role": "user", "content": [{"text": text}]})
+
+        resp = brt.converse(
+            modelId=os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0"),
+            system=[{"text": "You are a friendly, concise assistant. Keep replies under two sentences."}],
+            messages=msgs,
+            inferenceConfig={"maxTokens": 120, "temperature": 0.5},
+        )
+        parts = resp.get("output", {}).get("message", {}).get("content", [])
+        msg = (parts[0].get("text", "") if parts else "").strip()
+        return msg or "Hi! How can I help with your health data?"
+    return "Hi! How can I help with your health data?"
+
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    sid = req.session_id or "anon"
+    session = SESSIONS.get(sid, {"history": [], "last_sql": None, "columns": []})
+
+    intent = detect_intent(req.text)
+    if intent == "data":
+        prev_sql = (req.context or {}).get("last_sql") or session.get("last_sql")
+        res = nlq(NLQRequest(question=req.text, max_rows=req.max_rows), prev_sql=prev_sql)
+
+        # keep a tiny session memory
+        session["last_sql"] = res.get("sql")
+        session["columns"] = res.get("columns", [])
+        session["history"].extend([
+            {"role": "user", "content": req.text},
+            {"role": "assistant", "content": f"Ran SQL. Columns: {', '.join(res.get('columns', [])[:4])}..."}
+        ])
+        session["history"] = session["history"][-12:]
+        SESSIONS[sid] = session
+        return res
+
+    # smalltalk path — pass a short history
+    reply = _smalltalk_reply(req.text, history=(req.history or session.get("history", [])))
+    session["history"].extend([
+        {"role":"user", "content": req.text},
+        {"role":"assistant", "content": reply}
+    ])
+    session["history"] = session["history"][-12:]
+    SESSIONS[sid] = session
+    return {"text": reply}
+
