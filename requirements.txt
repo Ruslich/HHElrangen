@@ -1,0 +1,24 @@
+# Core Backend (FastAPI)
+fastapi==0.120.1
+uvicorn==0.38.0
+pydantic==2.12.3
+python-multipart
+
+# Frontend (Streamlit)
+streamlit==1.50.0
+
+# AWS Services
+boto3==1.40.61
+botocore==1.40.61
+
+# Data Processing
+pandas==2.3.3
+numpy==2.3.4
+
+# Visualization
+altair==5.5.0
+
+# Utilities
+python-dotenv==1.0.0
+cachetools==6.2.1
+requests==2.32.5
