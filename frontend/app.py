@@ -96,6 +96,21 @@ if DEMO_HIS_MODE:
     patient_mode = st.sidebar.toggle("Ask about selected patient", value=True, help="If on, the chat on the right will query FHIR/synthetic for this patient.")
     st.session_state["patient_mode"] = patient_mode
 
+    st.sidebar.markdown("### SMART (mock) Connect")
+    connect_pid = st.sidebar.text_input("Patient ID to bind (FHIR)", value=st.session_state["selected_patient_id"] or "")
+    if st.sidebar.button("Connect (mock SMART)"):
+        r = requests.post(f"{BACKEND}/smart/mock_login", json={"patient_id": connect_pid}, timeout=15)
+        if r.ok:
+            sid = r.json().get("session_id")
+            st.session_state["sid"] = sid
+            st.session_state["patient_id"] = connect_pid
+            st.sidebar.success(f"Connected as session {sid[:6]}…")
+        else:
+            st.sidebar.error(r.text)
+
+    sid = st.session_state.get("sid")
+
+
 else:
     st.sidebar.info("Demo HIS mode is off.")
 
@@ -282,7 +297,12 @@ if prompt:
             try:
                 if DEMO_HIS_MODE and patient_mode and sel_pid:
                     # -------- Patient mode: call /patient_chat --------
-                    payload = {"patient_id": sel_pid, "text": prompt, "days_back": 30}
+                    payload = {
+                        "patient_id": sel_pid,
+                        "text": prompt,
+                        "days_back": 30,
+                        "session_id": sid,  # <<— pass SMART-mock session so backend can use its access_token
+                    }
                     r = requests.post(f"{BACKEND}/patient_chat", json=payload, timeout=60)
                     if not r.ok:
                         try:

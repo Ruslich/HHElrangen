@@ -43,7 +43,18 @@ PREFIX = os.getenv("DATA_PREFIX", "data/")
 FHIR_BASE_URL = os.getenv("FHIR_BASE_URL", os.getenv("FHIR_BASE", "http://localhost:8080"))
 
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))  # 1 hour default
-SESSIONS = TTLCache(maxsize=500, ttl=SESSION_TTL)
+SESSIONS = TTLCache(maxsize=1000, ttl=SESSION_TTL)
+
+
+def put_session(sid: str, **kv):
+    s = SESSIONS.get(sid, {})
+    s.update(kv)
+    SESSIONS[sid] = s
+    return s
+
+def get_session(sid: str) -> dict:
+    return SESSIONS.get(sid, {})
+
 
 @app.get("/hello")
 def read_root():
@@ -97,6 +108,27 @@ class PatientChatRequest(BaseModel):
     patient_id: str
     text: str
     days_back: int = 7
+    session_id: Optional[str] = None  # SMART mock session id
+
+
+from fastapi import Body
+
+
+@app.post("/smart/mock_login")
+def smart_mock_login(patient_id: str = Body(..., embed=True)):
+    """
+    Issue a mock access token bound to a session. In real SMART, this would be the OAuth redirect/callback.
+    """
+    sid = md5(f"{patient_id}:{os.urandom(4)}".encode()).hexdigest()[:16]
+    # In real life, 'access_token' comes from the hospital's authorization server.
+    put_session(sid, access_token="mock-access-token", patient_id=patient_id)
+    return {"session_id": sid, "patient_id": patient_id}
+
+@app.post("/smart/logout")
+def smart_logout(session_id: str = Body(..., embed=True)):
+    SESSIONS.pop(session_id, None)
+    return {"ok": True}
+
 
 
 # --- Bedrock helpers (model selection, review/fix, limits) ---
@@ -1010,11 +1042,14 @@ def patient_chat(req: PatientChatRequest):
         for key, meta in LOINC.items():
             if key in t or meta["title"].lower() in t:
                 # Try FHIR first; if empty or request fails, we synthesize a realistic series
+                token = get_session(req.session_id).get("access_token") if req.session_id else None
+
                 points, is_synth = fhir_or_synth_observations(
                     req.patient_id,
                     meta["codes"],
                     days,
                     synth={"metric": meta["title"], "unit": meta["unit"], **meta["synth"]},
+                    access_token=token,
                 )
 
                 values = [p["value"] for p in points]
@@ -1071,7 +1106,9 @@ def patient_chat(req: PatientChatRequest):
 
         # ----- MEDICATION / ANTIBIOTIC INTENT -----
         if any(w in t for w in ["antibiotic", "antibiotics", "medication", "meds", "drugs"]):
-            meds = fetch_medications(req.patient_id, days_back=days)
+            token = get_session(req.session_id).get("access_token") if req.session_id else None
+            meds = fetch_medications(req.patient_id, days_back=days, access_token=token)
+
             rows = []
             for m in meds:
                 med_code = m.get("medicationCodeableConcept", {})
@@ -1103,30 +1140,20 @@ from .utils import fhir_get  # at top, if not already
 
 
 @app.get("/fhir_ping")
-def fhir_ping():
-    """
-    Quick connectivity check to the configured FHIR server.
-    """
+def fhir_ping(session_id: Optional[str] = None):
     try:
-        bundle = fhir_get("Patient", params={"_count": 3})
-        entries = bundle.get("entry", []) or []
-        patients = []
-        for e in entries:
+        from .utils import fhir_get
+        token = get_session(session_id).get("access_token") if session_id else None
+        bundle = fhir_get("Patient", params={"_count": 3}, access_token=token)
+        names = []
+        for e in bundle.get("entry", []):
             res = e.get("resource", {})
-            patients.append({
-                "id": res.get("id"),
-                "name": res.get("name"),
-                "gender": res.get("gender"),
-                "birthDate": res.get("birthDate"),
-            })
-        return {
-            "base_url": FHIR_BASE_URL,
-            "count": len(patients),
-            "patients": patients,
-        }
+            if res.get("resourceType") == "Patient":
+                names.append(res.get("id"))
+        return {"ok": True, "patients": names}
     except Exception as e:
-        # You’ll see error text in your browser / curl
-        raise HTTPException(status_code=500, detail=f"FHIR ping failed: {e}")
+        return {"ok": False, "error": str(e)}
+
 
 
 # --- Add in main.py, near other helpers ---
@@ -1145,7 +1172,7 @@ def _parse_days_back(text: str, default: int = 7) -> int:
     n = int(m.group(1))
     return n * 7 if m.group(2).startswith("w") else n
 
-def _obs_series_for(patient_id: str, loinc_keys: list[str], days_back: int) -> list[dict]:
+def _obs_series_for(patient_id: str, loinc_keys: list[str], days_back: int, session_id: str | None = None) -> list[dict]:
     from .utils import fetch_observations_by_code
     # expand keys like ["crp"] → codes list
     codes = []
@@ -1154,7 +1181,9 @@ def _obs_series_for(patient_id: str, loinc_keys: list[str], days_back: int) -> l
             codes.extend(Loinc[k.lower()])
         else:
             codes.append(k)
-    obs = fetch_observations_by_code(patient_id, codes, days_back)
+    # Use provided session_id to look up an access token if available; otherwise call without token
+    token = get_session(session_id).get("access_token") if session_id else None
+    obs = fetch_observations_by_code(patient_id, codes, days_back, access_token=token)
     pts = []
     for o in obs:
         # numeric value only

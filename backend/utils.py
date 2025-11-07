@@ -198,115 +198,137 @@ def suggest_chart(df: pd.DataFrame) -> Dict[str, str]:
 
 
 FHIR_BASE_URL = os.getenv("FHIR_BASE_URL", "").rstrip("/")
-FHIR_AUTH_TOKEN = os.getenv("FHIR_AUTH_TOKEN", "")
+FHIR_AUTH_TOKEN = os.getenv("FHIR_AUTH_TOKEN", "")  # fallback for local dev
 
-def fhir_get(path: str, params: dict | None = None) -> dict:
+def _auth_headers(access_token: str | None):
+    h = {"Accept": "application/fhir+json"}
+    tok = access_token or FHIR_AUTH_TOKEN
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+def fhir_get(path: str, params: dict | None = None, access_token: str | None = None) -> dict:
     if not FHIR_BASE_URL:
         raise RuntimeError("FHIR_BASE_URL not set")
-    headers = {"Accept": "application/fhir+json"}
-    if FHIR_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {FHIR_AUTH_TOKEN}"
     url = f"{FHIR_BASE_URL}/{path.lstrip('/')}"
-    r = requests.get(url, headers=headers, params=params or {}, timeout=10)
+    r = requests.get(url, headers=_auth_headers(access_token), params=params or {}, timeout=15)
     r.raise_for_status()
     return r.json()
 
-def fetch_observations(patient_id: str, loinc_code: str | None = None, days_back: int = 7) -> list[dict]:
-    import datetime as dt
 
-    params = {
-        "patient": patient_id,
-        "_count": 200,
-    }
+def fetch_observations(patient_id: str, loinc_code: str | None = None, days_back: int = 7,
+                       access_token: str | None = None) -> list[dict]:
+    import datetime as dt
+    since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+    params = {"patient": patient_id, "_count": 200, "date": f"ge{since}"}
     if loinc_code:
         params["code"] = loinc_code
-    since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
-    params["date"] = f"ge{since}"
-    bundle = fhir_get("Observation", params=params)
+    bundle = fhir_get("Observation", params=params, access_token=access_token)
     return [e["resource"] for e in bundle.get("entry", []) if "resource" in e]
+    
 
-def fetch_medications(patient_id: str, days_back: int = 7) -> list[dict]:
+def fetch_medications(
+    patient_id: str,
+    days_back: int = 7,
+    access_token: str | None = None,
+) -> list[dict]:
+    """
+    Try MedicationAdministration first (effective-time), then fallback to MedicationRequest (authoredon),
+    then MedicationStatement (effective). Returns a list of raw FHIR resources.
+    """
     import datetime as dt
-
     since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
-    params = {"patient": patient_id, "date": f"ge{since}", "_count": 200}
-    bundle = fhir_get("MedicationAdministration", params=params)
-    return [e["resource"] for e in bundle.get("entry", []) if "resource" in e]
+
+    # 1) MedicationAdministration (R4 search param: effective-time)
+    try:
+        params = {"patient": patient_id, "effective-time": f"ge{since}", "_count": 200}
+        bundle = fhir_get("MedicationAdministration", params=params, access_token=access_token)
+        entries = [e["resource"] for e in bundle.get("entry", []) if "resource" in e]
+        if entries:
+            return entries
+    except Exception:
+        pass
+
+    # 2) MedicationRequest (R4 search param: authoredon)
+    try:
+        params = {"patient": patient_id, "authoredon": f"ge{since}", "_count": 200}
+        bundle = fhir_get("MedicationRequest", params=params, access_token=access_token)
+        entries = [e["resource"] for e in bundle.get("entry", []) if "resource" in e]
+        if entries:
+            return entries
+    except Exception:
+        pass
+
+    # 3) MedicationStatement (R4 search param: effective)
+    try:
+        params = {"patient": patient_id, "effective": f"ge{since}", "_count": 200}
+        bundle = fhir_get("MedicationStatement", params=params, access_token=access_token)
+        entries = [e["resource"] for e in bundle.get("entry", []) if "resource" in e]
+        if entries:
+            return entries
+    except Exception:
+        pass
+
+    return []
+
+
 
 
 # --- Add to utils.py (near other FHIR helpers) ---
 
 # utils.py
 
-def _fhir_collect_all(path: str, params: dict) -> list[dict]:
-    """Follow _link.next to collect all bundle entries."""
-    import requests
+def _fhir_collect_all(path: str, params: dict, access_token: str | None = None) -> list[dict]:
+    """Follow Bundle.link[next] to collect all entries with auth."""
     out = []
-    # Ensure no accidental leading/trailing spaces in keys
     clean = {str(k).strip(): v for k, v in params.items() if v is not None}
-    r = requests.get(
-        f"{FHIR_BASE_URL.rstrip('/')}/{path}",
-        params=clean,
-        headers={"Accept": "application/fhir+json"},
-        timeout=15,
-    )
+    url = f"{FHIR_BASE_URL}/{path.lstrip('/')}"
+    r = requests.get(url, headers=_auth_headers(access_token), params=clean, timeout=15)
     r.raise_for_status()
     bundle = r.json()
 
     while True:
         out.extend([e["resource"] for e in bundle.get("entry", []) if "resource" in e])
 
+        # follow next link
         next_link = None
         for l in bundle.get("link", []):
             if l.get("relation") == "next":
                 next_link = l.get("url")
                 break
+
         if not next_link:
             break
 
-        r = requests.get(next_link, headers={"Accept": "application/fhir+json"}, timeout=15)
+        r = requests.get(next_link, headers=_auth_headers(access_token), timeout=15)
         r.raise_for_status()
         bundle = r.json()
 
     return out
 
 
-def fetch_observations_by_code(patient_id: str, loinc_codes: list[str], days_back: int = 7) -> list[dict]:
-    """
-    Fetch Observations for the given LOINC code(s).
-    OR semantics via comma-separated token list: code=1988-5,30522-7
-    """
+
+def fetch_observations_by_code(patient_id: str, loinc_codes: list[str], days_back: int = 7,
+                               access_token: str | None = None) -> list[dict]:
     import datetime as dt
     since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
-    params = {
-        "patient": patient_id,
-        "date": f"ge{since}",
-        "_count": 200,
-        "code": ",".join(loinc_codes),  # <-- correct OR syntax
-    }
-    return _fhir_collect_all("Observation", params)
+    params = {"patient": patient_id, "date": f"ge{since}", "_count": 200, "code": ",".join(loinc_codes)}
+    return _fhir_collect_all("Observation", params, access_token=access_token)
 
 
 
-def find_any_patient_with_observation(loinc_code: str, days_back: int = 365) -> str | None:
-    """
-    Try to discover a patient with this lab by scanning Observations and following _include=Observation:patient.
-    Returns a patient id or None (best-effort; public HAPI data is noisy).
-    """
+def find_any_patient_with_observation(loinc_code: str, days_back: int = 365,
+                                      access_token: str | None = None) -> str | None:
     import datetime as dt
     since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
-    params = {"code": loinc_code, "date": f"ge{since}", "_count": 50, "_include": "Observation:patient"}
-    bundle = fhir_get("Observation", params=params)
-    pats = []
+    params = {"code": loinc_code, "date": f"ge{since}", "_include": "Observation:patient", "_count": 100}
+    bundle = fhir_get("Observation", params=params, access_token=access_token)
+    # try to extract patient from included resources
     for e in bundle.get("entry", []):
         res = e.get("resource", {})
-        if res.get("resourceType") == "Patient" and res.get("id"):
-            pats.append(res["id"])
-        if res.get("resourceType") == "Observation":
-            subj = (res.get("subject") or {}).get("reference", "")
-            if subj.startswith("Patient/"):
-                pats.append(subj.split("/",1)[1])
-    return pats[0] if pats else None
+        if res.get("resourceType") == "Patient":
+            return res.get("id")
+    return None
 
 
 # utils.py
@@ -325,13 +347,15 @@ def synth_timeseries(days: int, start_value: float, drift: float = 0.0, noise: f
     return out
 
 
-def fhir_or_synth_observations(patient_id: str, loinc_codes: list[str], days_back: int, synth: dict):
+def fhir_or_synth_observations(patient_id: str, loinc_codes: list[str],
+                               days_back: int, synth: dict,
+                               access_token: str | None = None):    
     """
     Try FHIR. If nothing (or request fails), return synthetic series.
     'synth' = {"metric": "CRP", "unit": "mg/L", "start": 7.2, "drift": -0.1, "noise": 0.6}
     """
     try:
-        obs = fetch_observations_by_code(patient_id, loinc_codes, days_back)
+        obs = fetch_observations_by_code(patient_id, loinc_codes, days_back, access_token=access_token)
         pts = []
         for o in obs:
             vq = o.get("valueQuantity")
