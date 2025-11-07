@@ -1546,9 +1546,69 @@ def patient_chat(req: PatientChatRequest):
 
             return {"rows": rows, "explanation": explanation}
 
-        # ----- FALLBACK -----
+        # ----- FALLBACK: Use Claude for general queries -----
+        bedrock_enabled = os.getenv("BEDROCK_ENABLED", "false").lower()
+        print(f"[PATIENT_CHAT] Fallback triggered. BEDROCK_ENABLED={bedrock_enabled}")
+        print(f"[PATIENT_CHAT] Query text: {req.text}")
+        
+        if bedrock_enabled == "true":
+            print("[PATIENT_CHAT] Calling Claude Sonnet 4.5 for general response...")
+            try:
+                # Get patient context
+                token = get_session(req.session_id).get("access_token") if req.session_id else None
+                
+                # Try to fetch some patient data for context
+                patient_context = f"Patient ID: {req.patient_id}"
+                try:
+                    # Try to get recent meds for context
+                    meds = fetch_medications(req.patient_id, days_back=7, access_token=token)
+                    if meds:
+                        med_list = []
+                        for m in meds[:3]:  # Just first 3
+                            med_code = m.get("medicationCodeableConcept", {})
+                            text = med_code.get("text") or (med_code.get("coding", [{}])[0].get("display"))
+                            if text:
+                                med_list.append(text)
+                        if med_list:
+                            patient_context += f"\nRecent medications: {', '.join(med_list)}"
+                except Exception:
+                    pass  # Continue without meds context
+                
+                # Call Claude Sonnet 4.5 for intelligent response
+                system_prompt = """You are a helpful clinical AI assistant in a hospital EHR system. 
+You help healthcare professionals with patient data queries, lab results, and general medical questions.
+Keep responses concise, professional, and clinically relevant. If asked about specific patient data 
+you don't have access to, guide users on how to query it (e.g., "Show CRP last 7 days", 
+"Recent medications", "Creatinine last 30 days").
+Respond in German if appropriate to match the clinical setting."""
+                
+                user_prompt = f"{patient_context}\n\nUser question: {req.text}"
+                
+                model_id = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-sonnet-4-5-20250929-v1:0")
+                response = _bedrock_converse(
+                    model_id,
+                    system_text=system_prompt,
+                    user_text=user_prompt,
+                    max_tokens=300,
+                    temperature=0.7
+                )
+                
+                return {
+                    "answer": response,
+                    "explanation": response
+                }
+            except Exception as e:
+                print(f"[PATIENT_CHAT] ❌ Bedrock fallback failed: {e}")
+                print(f"[PATIENT_CHAT] Error type: {type(e).__name__}")
+                # Continue to deterministic fallback below
+        else:
+            print("[PATIENT_CHAT] Bedrock is disabled, using deterministic fallback")
+        
+        # Deterministic fallback if Bedrock is disabled or fails
+        print("[PATIENT_CHAT] Returning deterministic fallback response")
         return {
-            "answer": "Try: “Show CRP last 7 days”, “Creatinine last 30 days”, “Glucose last 14 days”, or “Recent antibiotics.”"
+            "answer": 'I can help you with specific patient data queries. Try: "Show CRP last 7 days", "Creatinine last 30 days", "Glucose last 14 days", or "Recent antibiotics."',
+            "explanation": 'Use specific medical queries to get patient data and lab results.'
         }
 
     except HTTPException:
@@ -1556,6 +1616,37 @@ def patient_chat(req: PatientChatRequest):
     except Exception as e:
         # keep the API resilient for the demo
         return {"answer": f"Something went wrong while processing the request: {e}"}
+
+
+@app.get("/bedrock_test")
+def bedrock_test():
+    """Test endpoint to verify Bedrock configuration and connectivity"""
+    bedrock_enabled = os.getenv("BEDROCK_ENABLED", "false")
+    bedrock_model = os.getenv("BEDROCK_MODEL_ID", "not-set")
+    bedrock_region = os.getenv("BEDROCK_REGION", "not-set")
+    
+    result = {
+        "bedrock_enabled": bedrock_enabled,
+        "bedrock_model": bedrock_model,
+        "bedrock_region": bedrock_region,
+        "test_call": None,
+        "error": None
+    }
+    
+    if bedrock_enabled.lower() == "true":
+        try:
+            response = _bedrock_converse(
+                bedrock_model,
+                system_text="You are a test assistant.",
+                user_text="Say 'Hello, Bedrock is working!' in exactly 5 words.",
+                max_tokens=50,
+                temperature=0.1
+            )
+            result["test_call"] = response
+        except Exception as e:
+            result["error"] = str(e)
+    
+    return result
 
 
 @app.get("/fhir_ping")
