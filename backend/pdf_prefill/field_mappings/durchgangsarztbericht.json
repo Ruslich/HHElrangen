@@ -1,0 +1,35 @@
+{
+  "template_file": "Durchgangsarztbericht_template.pdf",
+  "description": "Durchgangsarztbericht (accident report)",
+  "field_mapping": {
+    "Name der versicherten Person": "last_name",
+    "Vorname": "first_name",
+    "Geburtsdatum": "admissionDate",
+    "Krankenkasse": "department",
+    "Geschlecht": "gender",
+    "Vollständige Anschrift": "department",
+    "Eingetroffen am": "admissionDate",
+    "1 Unfalltag": "admissionDate",
+    "Textfield": "diagnosis",
+    "Textfield-0": "medications_text",
+    "2 Angaben der versicherten Person zum Unfallhergan": "diagnosis",
+    "3 Verhalten der versicherten Person nach dem Unfal": "notes",
+    "9 Vom Unfall unabhängige gesundheitliche Beeinträc": "notes",
+    "16 Bemerkungen z B Beratungsbedarf durch RehaManag": "notes"
+  },
+  "field_constraints": {
+    "3 Verhalten der versicherten Person nach dem Unfal": {
+      "max_length": 200,
+      "description": "Patient's behavior after the accident"
+    },
+    "9 Vom Unfall unabhängige gesundheitliche Beeinträc": {
+      "max_length": 150,
+      "description": "Pre-existing health conditions unrelated to accident"
+    },
+    "16 Bemerkungen z B Beratungsbedarf durch RehaManag": {
+      "max_length": 100,
+      "description": "Rehabilitation management notes"
+    }
+  },
+  "keywords": ["durchgangsarztbericht", "durchgangsarzt", "accident report", "d-arzt"]
+}

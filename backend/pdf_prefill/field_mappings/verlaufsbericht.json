@@ -1,0 +1,18 @@
+{
+  "template_file": "Verlaufsbericht_template.pdf",
+  "description": "Progress report for patient care documentation",
+  "field_mapping": {
+    "patient_first_name": "first_name",
+    "patient_last_name": "last_name",
+    "patient_full_name": "full_name",
+    "date_of_birth": "admissionDate",
+    "ward": "department",
+    "diagnoses": "diagnosis",
+    "medications": "medications_text",
+    "current_date": "admissionDate",
+    "verlauf_text": "notes",
+    "plan_text": "notes",
+    "glucose_summary": "labs_text"
+  },
+  "keywords": ["verlaufsbericht", "progress report", "verlauf", "report"]
+}

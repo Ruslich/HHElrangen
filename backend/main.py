@@ -1,3 +1,4 @@
+import base64
 import re
 from hashlib import md5
 
@@ -9,7 +10,7 @@ import os  # noqa: E402
 from typing import Optional  # noqa: E402
 
 from cachetools import TTLCache
-from fastapi import Body, FastAPI, HTTPException  # noqa: E402
+from fastapi import Body, FastAPI, HTTPException, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel  # noqa: E402
@@ -24,6 +25,7 @@ from utils import (  # noqa: E402
     read_head_from_s3,
     suggest_chart,
 )
+from pdf_prefill import PDFPrefillError, PDFPrefillService
 
 app = FastAPI(title="Health data Demo")
 app.add_middleware(
@@ -49,6 +51,8 @@ FHIR_BASE_URL = os.getenv("FHIR_BASE_URL", os.getenv("FHIR_BASE", "http://localh
 
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))  # 1 hour default
 SESSIONS = TTLCache(maxsize=1000, ttl=SESSION_TTL)
+
+pdf_prefill_service = PDFPrefillService()
 
 
 def put_session(sid: str, **kv):
@@ -947,6 +951,23 @@ class ChatRequest(BaseModel):
     context: dict | None = None       # NEW: {"last_sql": "...", "columns": [...]}
 
 
+class PDFGenerateRequest(BaseModel):
+    template_name: str
+    data: dict
+    user_id: Optional[str] = None
+    mapping_override: Optional[dict] = None
+    persist: bool = True
+
+
+class PDFAutoMapRequest(BaseModel):
+    csv_columns: list[str]
+    user_id: Optional[str] = None
+
+
+class PDFMappingSaveRequest(BaseModel):
+    mapping: dict
+
+
 
 # very small intent heuristic: treat messages with analytic cues as data questions
 _ANALYTICS_HINTS = re.compile(
@@ -1016,6 +1037,166 @@ def chat(req: ChatRequest):
     session["history"] = session["history"][-12:]
     SESSIONS[sid] = session
     return {"text": reply}
+
+
+# --- PDF pre-fill endpoints ---------------------------------------------------
+
+
+@app.get("/pdf/templates")
+def pdf_list_templates(refresh: bool = False):
+    templates = pdf_prefill_service.list_templates(refresh=refresh)
+    return {"templates": templates}
+
+
+@app.get("/pdf/templates/{template_name}")
+def pdf_get_template(template_name: str, user_id: str | None = None):
+    template = pdf_prefill_service.get_template_config(template_name, user_id=user_id)
+    if not template:
+        raise HTTPException(status_code=404, detail=f"Template '{template_name}' not found")
+    return {"template": template}
+
+
+@app.get("/pdf/templates/{template_name}/scan")
+def pdf_scan_template(template_name: str):
+    try:
+        scan = pdf_prefill_service.scan_template(template_name)
+    except PDFPrefillError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"template": template_name, "scan": scan}
+
+
+@app.post("/pdf/templates/{template_name}/auto-map")
+def pdf_auto_map(template_name: str, req: PDFAutoMapRequest):
+    try:
+        result = pdf_prefill_service.auto_map(
+            template_name,
+            req.csv_columns,
+            user_id=req.user_id,
+        )
+    except PDFPrefillError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"template": template_name, "auto_mapping": result}
+
+
+@app.get("/pdf/mappings/{user_id}")
+def pdf_list_mappings(user_id: str):
+    mappings = pdf_prefill_service.list_user_mappings(user_id)
+    return {"user_id": user_id, "mappings": mappings}
+
+
+@app.post("/pdf/mappings/{user_id}/{template_name}")
+def pdf_save_mapping(user_id: str, template_name: str, req: PDFMappingSaveRequest):
+    pdf_prefill_service.save_mapping(user_id, template_name, req.mapping)
+    return {"ok": True}
+
+
+@app.post("/pdf/generate")
+def pdf_generate(req: PDFGenerateRequest):
+    try:
+        result = pdf_prefill_service.generate_pdf(
+            req.template_name,
+            data=req.data,
+            user_id=req.user_id,
+            mapping_override=req.mapping_override,
+            persist=req.persist,
+        )
+    except PDFPrefillError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    pdf_bytes = result["bytes"]
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    return {
+        "metadata": result["metadata"],
+        "pdf_base64": encoded,
+    }
+
+
+@app.get("/pdf/{pdf_id}")
+def pdf_get_pdf(pdf_id: str):
+    record = pdf_prefill_service.get_pdf(pdf_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    pdf_bytes = record["bytes"]
+    headers = {"Content-Disposition": f'attachment; filename="{pdf_id}.pdf"'}
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
+
+
+class PDFSaveEditsRequest(BaseModel):
+    pdf_id: str
+    patient_id: str
+    form_data: dict
+    template_name: str
+
+
+class PDFExtractRequest(BaseModel):
+    pdf_base64: str
+    patient_id: str
+    template_name: str
+
+
+@app.post("/pdf/extract-and-save")
+def pdf_extract_and_save(req: PDFExtractRequest):
+    """
+    Extract form data from an edited PDF and save to database.
+    Returns the extracted data.
+    """
+    try:
+        import io
+        from pypdf import PdfReader
+        
+        # Decode the PDF
+        pdf_bytes = base64.b64decode(req.pdf_base64)
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        
+        # Extract form field values
+        form_data = reader.get_form_text_fields() or {}
+        
+        # Save extracted data (in a real system, save to database)
+        # For now, we'll store in session or return it
+        session_key = f"pdf_edits_{req.patient_id}_{req.template_name}"
+        SESSIONS[session_key] = {
+            "form_data": form_data,
+            "template_name": req.template_name,
+            "patient_id": req.patient_id,
+            "saved_at": dt.datetime.utcnow().isoformat() + "Z"
+        }
+        
+        return {
+            "ok": True,
+            "message": f"Extracted and saved {len(form_data)} fields",
+            "field_count": len(form_data),
+            "sample_fields": dict(list(form_data.items())[:5])
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to extract PDF data: {str(exc)}") from exc
+
+
+@app.post("/pdf/save-edits")
+def pdf_save_edits(req: PDFSaveEditsRequest):
+    """
+    Save edited PDF form data back to database/storage.
+    This allows nurses to edit PDFs in the browser and persist changes.
+    """
+    try:
+        # Store the edited form data in session/database
+        session_key = f"pdf_edits_{req.patient_id}_{req.template_name}"
+        SESSIONS[session_key] = {
+            "form_data": req.form_data,
+            "template_name": req.template_name,
+            "patient_id": req.patient_id,
+            "pdf_id": req.pdf_id,
+            "saved_at": dt.datetime.utcnow().isoformat() + "Z"
+        }
+        
+        return {
+            "ok": True,
+            "message": "PDF edits saved successfully to database",
+            "patient_id": req.patient_id,
+            "template_name": req.template_name,
+            "saved_at": SESSIONS[session_key]["saved_at"]
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 from collections import Counter

@@ -1,0 +1,23 @@
+{
+  "template_file": "Entlassungsbericht_template.pdf",
+  "description": "Discharge report / Entlassungsbericht",
+  "field_mapping": {
+    "Name der versicherten Person": "last_name",
+    "Vorname": "first_name",
+    "Geburtsdatum": "admissionDate",
+    "Eingetroffen am": "admissionDate",
+    "Unfalltag": "admissionDate",
+    "Krankenkasse": "department",
+    "Geschlecht": "gender",
+    "Vollständige Anschrift": "department",
+    "Text1": "diagnosis",
+    "Text2": "medications_text",
+    "11 Bemerkungen z B Beratungsbedarf durch RehaManag": "notes"
+  },
+  "field_constraints": {
+    "11 Bemerkungen z B Beratungsbedarf durch RehaManag": {
+      "max_length": 200
+    }
+  },
+  "keywords": ["entlassungsbericht", "discharge", "entlassung", "discharge report"]
+}

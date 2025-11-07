@@ -1,0 +1,32 @@
+{
+  "template_file": "Ärztlicher_Entlassungsberich_template.pdf",
+  "description": "Medical discharge report / Ärztlicher Entlassungsbericht",
+  "field_mapping": {
+    "patient_name": "full_name",
+    "patient_first_name": "first_name",
+    "patient_last_name": "last_name",
+    "geburtsdatum": "admissionDate",
+    "aufnahmedatum": "admissionDate",
+    "entlassungsdatum": "admissionDate",
+    "station": "department",
+    "abteilung": "department",
+    "zimmer": "room",
+    "patientennummer": "id",
+    "mrn": "mrn",
+    "hauptdiagnose": "diagnosis",
+    "diagnose": "diagnosis",
+    "nebendiagnosen": "notes",
+    "medikation": "medications_text",
+    "entlassmedikation": "medications_text",
+    "vitalwerte": "vitals_text",
+    "laborwerte": "labs_text",
+    "befunde": "labs_text",
+    "therapie": "notes",
+    "proceduren": "notes",
+    "verlauf": "notes",
+    "empfehlungen": "notes",
+    "weiterbehandlung": "notes"
+  },
+  "keywords": ["ärztlicher entlassungsbericht", "medical discharge", "arztbrief"]
+}
+
