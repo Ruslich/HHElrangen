@@ -168,8 +168,8 @@ def _bedrock_converse(model_id: str, system_text: str, user_text: str,
         messages=[{"role": "user", "content": [{"text": user_text}]}],
         inferenceConfig={
             "maxTokens": int(os.getenv("NLQ_MAX_TOKENS", max_tokens or 220)),
-            "temperature": float(os.getenv("NLQ_TEMPERATURE", temperature or 0.1)),
-            "topP": 0.9
+            "temperature": float(os.getenv("NLQ_TEMPERATURE", temperature or 0.1))
+            # Note: topP removed - Claude Sonnet 4.5 doesn't allow both temperature and topP
         },
     )
     parts = resp.get("output", {}).get("message", {}).get("content", [])
@@ -298,7 +298,7 @@ def _plan_with_bedrock(text: str, defaults: dict) -> dict:
             modelId=model_id,
             system=system,
             messages=messages,
-            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature, "topP": 0.9},
+            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
         )
         parts = resp.get("output", {}).get("message", {}).get("content", [])
         content = parts[0].get("text", "") if parts else ""
@@ -381,7 +381,7 @@ def _summarize_with_bedrock(summary_inputs: dict, force_off: bool = False) -> st
             modelId=model_id,
             system=system,
             messages=messages,
-            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature, "topP": 0.9},
+            inferenceConfig={"maxTokens": max_tokens, "temperature": temperature},
         )
         parts = resp.get("output", {}).get("message", {}).get("content", [])
         if parts and "text" in parts[0]:
