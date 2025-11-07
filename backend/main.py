@@ -938,7 +938,7 @@ def _smalltalk_reply(text: str, history: list[dict]) -> str:
         msgs.append({"role": "user", "content": [{"text": text}]})
 
         resp = brt.converse(
-            modelId=os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0"),
+            modelId=os.getenv("BEDROCK_LITE_MODEL_ID", "amazon.nova-lite-v1:0"),
             system=[{"text": "You are a friendly, concise assistant. Keep replies under two sentences."}],
             messages=msgs,
             inferenceConfig={"maxTokens": 120, "temperature": 0.5},
