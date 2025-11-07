@@ -1256,16 +1256,6 @@ def pdf_generate(req: PDFGenerateRequest):
     }
 
 
-@app.get("/pdf/{pdf_id}")
-def pdf_get_pdf(pdf_id: str):
-    record = pdf_prefill_service.get_pdf(pdf_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="PDF not found")
-    pdf_bytes = record["bytes"]
-    headers = {"Content-Disposition": f'attachment; filename="{pdf_id}.pdf"'}
-    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
-
-
 class PDFSaveEditsRequest(BaseModel):
     pdf_id: str
     patient_id: str
@@ -1333,6 +1323,10 @@ def pdf_save_edits(req: PDFSaveEditsRequest):
             "saved_at": dt.datetime.utcnow().isoformat() + "Z"
         }
         
+        print(f"[SAVE] Saved {len(req.form_data)} fields for patient {req.patient_id}, template {req.template_name}")
+        print(f"[SAVE] Session key: {session_key}")
+        print(f"[SAVE] Sample data: {dict(list(req.form_data.items())[:3])}")
+        
         return {
             "ok": True,
             "message": "PDF edits saved successfully to database",
@@ -1342,6 +1336,43 @@ def pdf_save_edits(req: PDFSaveEditsRequest):
         }
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/pdf/get-saved-edits")
+def pdf_get_saved_edits(patient_id: str, template_name: str):
+    """
+    Retrieve saved PDF form edits for a patient and template.
+    Returns the saved form data so edits persist across sessions.
+    """
+    session_key = f"pdf_edits_{patient_id}_{template_name}"
+    saved = SESSIONS.get(session_key)
+    
+    if saved:
+        print(f"[LOAD] Found saved edits for patient {patient_id}, template {template_name}")
+        print(f"[LOAD] {len(saved.get('form_data', {}))} fields saved")
+        return {
+            "ok": True,
+            "form_data": saved.get("form_data", {}),
+            "saved_at": saved.get("saved_at")
+        }
+    else:
+        print(f"[LOAD] No saved edits found for {session_key}")
+        return {
+            "ok": False,
+            "form_data": {},
+            "message": "No saved edits found"
+        }
+
+
+@app.get("/pdf/{pdf_id}")
+def pdf_get_pdf(pdf_id: str):
+    """Download a generated PDF by ID"""
+    record = pdf_prefill_service.get_pdf(pdf_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="PDF not found")
+    pdf_bytes = record["bytes"]
+    headers = {"Content-Disposition": f'attachment; filename="{pdf_id}.pdf"'}
+    return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
 
 
 from collections import Counter
