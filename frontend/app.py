@@ -92,9 +92,9 @@ if DEMO_HIS_MODE:
     if col3.button("Meds 7d"):
         st.session_state["patient_quick"] = "Recent antibiotics"
 
-    st.sidebar.divider()
-    patient_mode = st.sidebar.toggle("Ask about selected patient", value=True, help="If on, the chat on the right will query FHIR/synthetic for this patient.")
-    st.session_state["patient_mode"] = patient_mode
+    # st.sidebar.divider()
+    # patient_mode = st.sidebar.toggle("Ask about selected patient", value=True, help="If on, the chat on the right will query FHIR/synthetic for this patient.")
+    # st.session_state["patient_mode"] = patient_mode
 
     st.sidebar.markdown("### SMART (mock) Connect")
     connect_pid = st.sidebar.text_input("Patient ID to bind (FHIR)", value=st.session_state["selected_patient_id"] or "")
@@ -117,6 +117,12 @@ else:
 
 # ------------- Main: Chat-first UI -------------
 st.title("Healthcare Helper")
+
+sid = st.session_state.get("sid")
+bound_pid = st.session_state.get("patient_id")
+if bound_pid:
+    st.caption(f"SMART context active · patient `{bound_pid}`")
+
 
 # Chat transcript
 st.subheader("Chat")
@@ -288,20 +294,27 @@ if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Decide patient vs population mode
-    patient_mode = bool(st.session_state.get("patient_mode"))
-    sel_pid = st.session_state.get("selected_patient_id")  # set by the Demo HIS dropdown
+    # -------- Intent-based routing (no sidebar toggle) --------
+    # 1) choose a patient id if we have SMART, else (if Demo HIS on) use selection
+    sel_pid = st.session_state.get("patient_id") or st.session_state.get("selected_patient_id")
+
+    # 2) detect simple patient intents (labs/meds) from text
+    t = (prompt or "").lower()
+    is_patient_intent = any(w in t for w in [
+        "crp", "creatinine", "glucose",
+        "antibiotic", "antibiotics", "medication", "meds", "drugs"
+    ])
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             try:
-                if DEMO_HIS_MODE and patient_mode and sel_pid:
-                    # -------- Patient mode: call /patient_chat --------
+                if is_patient_intent and sel_pid:
+                    # ---- Patient route → /patient_chat ----
                     payload = {
                         "patient_id": sel_pid,
                         "text": prompt,
                         "days_back": 30,
-                        "session_id": sid,  # <<— pass SMART-mock session so backend can use its access_token
+                        "session_id": sid,  # SMART (mock) session token threading
                     }
                     r = requests.post(f"{BACKEND}/patient_chat", json=payload, timeout=60)
                     if not r.ok:
@@ -313,7 +326,6 @@ if prompt:
                     else:
                         j = r.json()
 
-                    # Render patient response
                     if "timeseries" in j or "chart" in j:
                         st.subheader("Patient chart")
                         render_chart(j.get("chart", {"type": "table"}), j.get("timeseries", []), j.get("metric"))
@@ -330,8 +342,8 @@ if prompt:
                         st.write(j.get("answer", "No answer."))
                         assistant_msg = j.get("answer", "No answer.")
                 else:
-                    # -------- Population mode: call /chat (your existing analytics path) --------
-                    history = st.session_state.messages[-6:]  # keep it cheap
+                    # ---- Cohort/smalltalk route → /chat ----
+                    history = st.session_state.messages[-6:]
                     payload = {
                         "text": prompt,
                         "history": history,
@@ -341,7 +353,6 @@ if prompt:
                             "columns": st.session_state.get("columns"),
                         },
                     }
-
                     r = requests.post(f"{BACKEND}/chat", json=payload, timeout=120)
                     if not r.ok:
                         try:
@@ -366,6 +377,7 @@ if prompt:
             except Exception as e:
                 st.error(f"Oops: {e}")
                 assistant_msg = f"Oops: {e}"
+
 
     # append assistant message to transcript
     st.session_state.messages.append({"role": "assistant", "content": assistant_msg})
