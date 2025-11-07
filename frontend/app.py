@@ -588,30 +588,51 @@ if res:
 # ============================================================================
 # CarePilot Widget Integration
 # ============================================================================
-# Embed the CarePilot chat widget on every page
-st.markdown("""
-<script src="../carepilot-embed/dist/widget.iife.js"></script>
-<link rel="stylesheet" href="../carepilot-embed/dist/widget.css">
+# Embed the CarePilot chat widget using Streamlit components
+import streamlit.components.v1 as components
+
+# Read the widget files
+import pathlib
+widget_dir = pathlib.Path(__file__).parent.parent / "carepilot-embed" / "dist"
+widget_js = (widget_dir / "widget.iife.js").read_text()
+widget_css = (widget_dir / "widget.css").read_text()
+
+patient_id = st.session_state.get("selected_patient_id", "")
+patient_name = st.session_state.get("selected_patient_name", "")
+
+# Inject the widget
+components.html(f"""
+<style>
+{widget_css}
+</style>
 <div id="carepilot-root"></div>
 <script>
-  (function() {
-    if (window.CarePilot) {
-      const patientId = '%s';
-      const patientName = '%s';
-      const apiUrl = '%s';
-      
-      window.CarePilot.init({
-        apiUrl: apiUrl,
-        patientId: patientId,
-        patientName: patientName,
-        department: 'Intensivstation',
-        useVerticalTab: false
-      });
-    }
-  })();
+{widget_js}
 </script>
-""" % (
-    st.session_state.get("selected_patient_id", ""),
-    st.session_state.get("selected_patient_name", ""),
-    BACKEND
-), unsafe_allow_html=True)
+<script>
+  (function() {{
+    console.log('CarePilot: Initializing widget...');
+    
+    // Wait for CarePilot to be available
+    function initWidget() {{
+      if (window.CarePilot && window.CarePilot.init) {{
+        console.log('CarePilot: Found widget, initializing...');
+        window.CarePilot.init({{
+          apiUrl: '{BACKEND}',
+          patientId: '{patient_id}',
+          patientName: '{patient_name}',
+          department: 'Intensivstation',
+          useVerticalTab: false
+        }});
+        console.log('CarePilot: Widget initialized successfully');
+      }} else {{
+        console.log('CarePilot: Widget not ready, retrying in 100ms...');
+        setTimeout(initWidget, 100);
+      }}
+    }}
+    
+    // Start initialization after a short delay
+    setTimeout(initWidget, 100);
+  }})();
+</script>
+""", height=0, scrolling=False)
