@@ -586,53 +586,79 @@ if res:
 # st.caption(f"Backend: {BACKEND}")
 
 # ============================================================================
-# CarePilot Widget Integration
+# CarePilot Widget Integration - FIXED VERSION
 # ============================================================================
-# Embed the CarePilot chat widget using Streamlit components
 import streamlit.components.v1 as components
-
-# Read the widget files
 import pathlib
+
+# Get patient info
+patient_id = st.session_state.get("selected_patient_id", "DEMO-CRP-001")
+patient_name = st.session_state.get("selected_patient_name", "Unknown Patient")
+
+# Read widget files directly
 widget_dir = pathlib.Path(__file__).parent.parent / "carepilot-embed" / "dist"
-widget_js = (widget_dir / "widget.iife.js").read_text()
-widget_css = (widget_dir / "widget.css").read_text()
 
-patient_id = st.session_state.get("selected_patient_id", "")
-patient_name = st.session_state.get("selected_patient_name", "")
-
-# Inject the widget
-components.html(f"""
-<style>
-{widget_css}
-</style>
-<div id="carepilot-root"></div>
-<script>
-{widget_js}
-</script>
-<script>
-  (function() {{
-    console.log('CarePilot: Initializing widget...');
+try:
+    widget_js = (widget_dir / "widget.iife.js").read_text(encoding='utf-8')
+    widget_css = (widget_dir / "widget.css").read_text(encoding='utf-8')
     
-    // Wait for CarePilot to be available
-    function initWidget() {{
-      if (window.CarePilot && window.CarePilot.init) {{
-        console.log('CarePilot: Found widget, initializing...');
-        window.CarePilot.init({{
-          apiUrl: '{BACKEND}',
-          patientId: '{patient_id}',
-          patientName: '{patient_name}',
-          department: 'Intensivstation',
-          useVerticalTab: false
-        }});
-        console.log('CarePilot: Widget initialized successfully');
-      }} else {{
-        console.log('CarePilot: Widget not ready, retrying in 100ms...');
-        setTimeout(initWidget, 100);
-      }}
-    }}
+    # Embed widget with proper escaping and parent frame access
+    widget_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <style>{widget_css}</style>
+</head>
+<body style="margin: 0; padding: 0; overflow: visible;">
+    <div id="carepilot-root"></div>
+    <script>
+    {widget_js}
     
-    // Start initialization after a short delay
-    setTimeout(initWidget, 100);
-  }})();
-</script>
-""", height=0, scrolling=False)
+    // Initialize immediately
+    (function() {{
+        console.log('[CarePilot] Starting initialization...');
+        console.log('[CarePilot] Window object:', typeof window);
+        console.log('[CarePilot] CarePilot available:', typeof window.CarePilot);
+        
+        let attempts = 0;
+        const maxAttempts = 50;
+        
+        function init() {{
+            attempts++;
+            console.log('[CarePilot] Init attempt', attempts);
+            
+            if (typeof window.CarePilot !== 'undefined' && window.CarePilot.init) {{
+                try {{
+                    console.log('[CarePilot] Initializing widget...');
+                    window.CarePilot.init({{
+                        apiUrl: '{BACKEND}',
+                        patientId: '{patient_id}',
+                        patientName: '{patient_name}',
+                        department: 'Intensivstation',
+                        useVerticalTab: false
+                    }});
+                    console.log('[CarePilot] ✅ Widget initialized successfully!');
+                }} catch (error) {{
+                    console.error('[CarePilot] ❌ Initialization error:', error);
+                }}
+            }} else if (attempts < maxAttempts) {{
+                console.log('[CarePilot] Not ready yet, retrying...');
+                setTimeout(init, 100);
+            }} else {{
+                console.error('[CarePilot] ❌ Failed to initialize after', maxAttempts, 'attempts');
+            }}
+        }}
+        
+        // Start init process
+        setTimeout(init, 100);
+    }})();
+    </script>
+</body>
+</html>
+"""
+    
+    # Render the component with sufficient height to show the floating button
+    components.html(widget_html, height=800, scrolling=False)
+    
+except Exception as e:
+    st.error(f"Failed to load CarePilot widget: {{e}}")
