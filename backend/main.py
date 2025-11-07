@@ -14,9 +14,11 @@ from fastapi import Body, FastAPI, HTTPException, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel  # noqa: E402
-from utils import (  # noqa: E402
+
+from .utils import (  # noqa: E402
     athena_sql_to_df,
     fetch_medications,
+    fhir_get,
     fhir_or_synth_observations,
     get_table_summaries,
     is_sql_safe,
@@ -611,6 +613,51 @@ def _make_text_filters_case_insensitive(sql: str) -> str:
     return "".join(parts)
 
 
+def _athena_fix_common(sql: str) -> str:
+    import re
+    s = sql
+
+    # PERCENTILE_CONT(...) WITHIN GROUP (ORDER BY x)  -> approx_percentile(x, q)
+    s = re.sub(
+        r"PERCENTILE_CONT\(\s*0\.5\s*\)\s*WITHIN\s+GROUP\s*\(\s*ORDER\s+BY\s+([^)]+)\)",
+        r"approx_percentile(\1, 0.5)",
+        s, flags=re.I
+    )
+    s = re.sub(
+        r"PERCENTILE_CONT\(\s*0\.9\s*\)\s*WITHIN\s+GROUP\s*\(\s*ORDER\s+BY\s+([^)]+)\)",
+        r"approx_percentile(\1, 0.9)",
+        s, flags=re.I
+    )
+    s = re.sub(
+        r"PERCENTILE_CONT\(\s*([01](?:\.\d+)?)\s*\)\s*WITHIN\s+GROUP\s*\(\s*ORDER\s+BY\s+([^)]+)\)",
+        r"approx_percentile(\2, \1)",
+        s, flags=re.I
+    )
+
+    # DATEDIFF(day, start, end)  -> date_diff('day', start, end)
+    s = re.sub(
+        r"DATEDIFF\s*\(\s*day\s*,\s*([^,]+)\s*,\s*([^)]+)\)",
+        r"date_diff('day', \1, \2)",
+        s, flags=re.I
+    )
+
+    # DATE_SUB(CURRENT_DATE, INTERVAL 6 MONTH) -> date_add('month', -6, current_date)
+    s = re.sub(
+        r"DATE_SUB\s*\(\s*CURRENT_DATE\s*,\s*INTERVAL\s+(\d+)\s+MONTH\s*\)",
+        r"date_add('month', -\1, current_date)",
+        s, flags=re.I
+    )
+
+    # EXTRACT(DOW FROM x) -> day_of_week(x)
+    s = re.sub(
+        r"EXTRACT\s*\(\s*DOW\s+FROM\s+([^)]+)\)",
+        r"day_of_week(\1)",
+        s, flags=re.I
+    )
+
+    return s
+
+
 def _build_sql_prompt(question: str, prev_sql: str | None = None) -> str:
     """
     Build a schema-aware prompt using the *current* Glue/Athena schema.
@@ -723,6 +770,8 @@ def _build_sql_prompt(question: str, prev_sql: str | None = None) -> str:
         "- Prefer fully qualified FROM {db}.{table}. Use LOWER(col) for case-insensitive text filters.\n"
         "- For 'most popular' or 'most frequent', GROUP BY the target and ORDER BY COUNT(*) DESC LIMIT N.\n"
         "- CAST to double when averaging/summing text numeric columns.\n\n"
+        "- Use Athena/Presto syntax: date_diff('day', start, end); date_add('month', -N, current_date); approx_percentile(x, 0.5 or 0.9); day_of_week(date_col).\n"
+        "- For LOS: define length_of_stay_days := date_diff('day', \"Date of Admission\", \"Discharge Date\").\n"
     )
 
     if examples:
@@ -868,6 +917,81 @@ def _counts_summary_from_df(df, sql: str) -> str | None:
     return head + ': ' + "; ".join(parts) + '.'
 
 
+def _python_los_answer(question: str) -> dict | None:
+    """
+    Fallback for LOS-type questions when Athena fails.
+    Supports:
+      - median/p90 LOS by Medical Condition (optionally 'last N months')
+      - median LOS by weekday of Date of Admission
+    Returns a dict shaped like /nlq output (chart + rows + summary) or None if not applicable.
+    """
+    import re
+
+    import numpy as np
+    import pandas as pd
+
+    from .utils import read_csv_from_s3
+
+    q = (question or "").lower()
+    # Only trigger on clear LOS intents
+    if not any(k in q for k in ["length of stay", "los", "median los", "p90 los"]):
+        return None
+
+    # Load the demo CSV quickly
+    try:
+        df = read_csv_from_s3(BUCKET, f"{PREFIX}labs.csv")
+    except Exception:
+        return None
+
+    # Required columns
+    for c in ["Date of Admission", "Discharge Date"]:
+        if c not in df.columns:
+            return None
+
+    df["Date of Admission"] = pd.to_datetime(df["Date of Admission"], errors="coerce")
+    df["Discharge Date"] = pd.to_datetime(df["Discharge Date"], errors="coerce")
+    df = df.dropna(subset=["Date of Admission", "Discharge Date"])
+    df["LOS_days"] = (df["Discharge Date"] - df["Date of Admission"]).dt.days
+
+    # Last N months filter if present
+    m = re.search(r"last\s+(\d+)\s*month", q)
+    if m:
+        n = int(m.group(1))
+        cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(months=n)
+        df = df[df["Date of Admission"] >= cutoff]
+
+    # 1) By condition: “median and 90th percentile by Medical Condition”
+    if "by medical condition" in q and "weekday" not in q:
+        group_col = "Medical Condition" if "Medical Condition" in df.columns else None
+        if not group_col:
+            return None
+        g = (df.groupby(group_col)["LOS_days"]
+                .agg(median_los="median",
+                     p90_los=lambda s: float(np.nanpercentile(s.dropna(), 90)),
+                     patient_count="count")
+                .reset_index()
+                .sort_values("p90_los", ascending=False)
+             )
+        rows = g.rename(columns={group_col: "group", "p90_los": "p90", "median_los": "median"}).to_dict(orient="records")
+        chart = {"type": "bar", "x": "group", "y": "p90", "title": "90th percentile LOS by condition", "labels": True}
+        summary = f"Computed LOS (Discharge−Admission). Top group shows longest p90 LOS; medians included in table. N={int(df.shape[0])}."
+        return {"rows": rows, "chart": chart, "columns": list(g.columns), "summary": summary}
+
+    # 2) Weekend effect: “median LOS by weekday of Date of Admission”
+    if "weekday" in q or "day of week" in q:
+        w = df.groupby(df["Date of Admission"].dt.dayofweek)["LOS_days"].median().reset_index()
+        w.columns = ["weekday", "median_los"]
+        # Map 0..6 -> Mon..Sun
+        names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+        w["weekday"] = w["weekday"].map(lambda i: names[int(i)] if 0 <= int(i) <= 6 else str(i))
+        rows = w.to_dict(orient="records")
+        chart = {"type": "bar", "x": "weekday", "y": "median_los", "title": "Median LOS by weekday of admission", "labels": True}
+        summary = f"Median LOS by admission weekday. Overall median ≈ {float(df['LOS_days'].median()):.1f} days."
+        return {"rows": rows, "chart": chart, "columns": list(w.columns), "summary": summary}
+
+    return None
+
+
 
 @app.post("/nlq")
 def nlq(req: NLQRequest, prev_sql: str | None = None):
@@ -892,6 +1016,8 @@ def nlq(req: NLQRequest, prev_sql: str | None = None):
     # DEBUG: did we rewrite for medication frequency?
     before = sql
     sql = _semantic_sql_adjust(req.question, sql)
+    sql = _athena_fix_common(sql)
+    sql = _enforce_row_limit(sql, int(os.getenv("NLQ_DEFAULT_LIMIT", str(req.max_rows or 1000))))
     rewrote_medication = (sql != before)
 
     # 3b) Safety + LIMIT
@@ -913,6 +1039,7 @@ def nlq(req: NLQRequest, prev_sql: str | None = None):
         repaired = _review_and_fix_sql(req.question, sql, error=str(e1))
         repaired = _make_text_filters_case_insensitive(repaired)
         repaired = _semantic_sql_adjust(req.question, repaired)
+        repaired = _athena_fix_common(repaired)
         repaired = _enforce_row_limit(repaired, int(os.getenv("NLQ_DEFAULT_LIMIT", str(req.max_rows or 1000))))
         if not is_sql_safe(repaired):
             raise HTTPException(status_code=500, detail=f"Athena error: {e1}. Also produced unsafe repair: {repaired}")
@@ -920,16 +1047,28 @@ def nlq(req: NLQRequest, prev_sql: str | None = None):
             df = athena_sql_to_df(repaired)
             sql = repaired  # use the fixed version going forward
         except Exception as e2:
+            # ---- NEW: Python fallback for LOS-type questions ----
+            fallback = _python_los_answer(req.question)
+            if fallback:
+                return {
+                    "chart": fallback.get("chart", {"type": "table"}),
+                    "rows": fallback.get("rows", []),
+                    "columns": fallback.get("columns", []),
+                    "summary": fallback.get("summary", "Computed locally due to Athena error."),
+                    "sql": "(python fallback; Athena failed)",
+                }
             raise HTTPException(status_code=500, detail=f"Athena error: {e2}. Original: {e1}. SQL: {sql}")
+
 
     # 5) Visualization + summary (unchanged)
     chart = suggest_chart(df)
     preview = df.head(50).to_dict(orient="records")
 
     smart_summary = _counts_summary_from_df(df, sql)
-    summary = smart_summary or _summarize_with_bedrock(
+    summary = _summarize_with_bedrock(
         {"question": req.question, "sql": sql, "columns": list(df.columns)[:6], "rows": len(df)}
-    )
+    ) if not smart_summary else smart_summary
+
 
     return {
         "sql": sql,
@@ -987,13 +1126,18 @@ def _smalltalk_reply(text: str, history: list[dict]) -> str:
             read_timeout=6, connect_timeout=3,
         ))
 
-        # Build a short message list: system + last few turns + current user
-        msgs = []
-        for h in history[-6:]:
+        # Build a short message list that ALWAYS starts with a user message.
+        # 1) current user first
+        msgs = [{"role": "user", "content": [{"text": (text or "").strip()}]}]
+
+        # 2) then a compact slice of prior turns (user/assistant), if any
+        for h in (history or [])[-6:]:
             role = "user" if h.get("role") == "user" else "assistant"
-            if h.get("content"):
-                msgs.append({"role": role, "content": [{"text": h["content"]}]})
-        msgs.append({"role": "user", "content": [{"text": text}]})
+            content = (h.get("content") or "").strip()
+            if not content:
+                continue
+            msgs.append({"role": role, "content": [{"text": content}]})
+
 
         resp = brt.converse(
             modelId=os.getenv("BEDROCK_LITE_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"),
@@ -1217,6 +1361,66 @@ def patient_chat(req: PatientChatRequest):
         t = (req.text or "").lower()
         days = _parse_days_back(req.text, req.days_back)
 
+                # ---- CORRELATION: Antibiotics vs CRP ----
+        if ("crp" in t) and ("antibiotic" in t or "antibiotics" in t or "cef" in t or "piperacillin" in t or "tazo" in t or "vanco" in t):
+            token = get_session(req.session_id).get("access_token") if req.session_id else None
+
+            # Try to capture a specific drug name from free text
+            abx_name = _extract_abx_name(req.text)
+
+            # 1) CRP time series (FHIR first, synthetic fallback)
+            crp_points, is_synth = fhir_or_synth_observations(
+                req.patient_id,
+                ["1988-5", "30522-7"],
+                days,
+                synth={"metric": "CRP", "unit": "mg/L", "start": 7.5, "drift": -0.05, "noise": 0.4},
+                access_token=token,
+            )
+
+            # 2) Antibiotic doses per day, filtered if a drug was named
+            from .utils import antibiotic_doses_per_day
+            abx_daily = antibiotic_doses_per_day(
+                req.patient_id,
+                days_back=days,
+                access_token=token,
+                filter_names=[abx_name] if abx_name else None,
+            )
+
+            # 3) Scale antibiotics to CRP axis so both fit on one chart
+            crp_peak = max([p["value"] for p in crp_points] + [1.0])
+            max_dose = max([p["value"] for p in abx_daily] + [1])
+            abx_scaled = [
+                {"date": p["date"], "value": (p["value"] / max_dose) * crp_peak * 0.9}
+                for p in abx_daily
+            ]
+
+            # 4) Combine series
+            series_label = f"{abx_name} (doses/day, scaled)" if abx_name else "Antibiotics (doses/day, scaled)"
+            rows = []
+            rows += [{"date": p["date"], "value": p["value"], "group": "CRP (mg/L)"} for p in crp_points]
+            rows += [{"date": p["date"], "value": p["value"], "group": series_label} for p in abx_scaled]
+
+            # 5) Doctor-like explanation with expected behavior
+            drug_txt = f" **{abx_name}**" if abx_name else ""
+            explanation = (
+                f"CRP vs{drug_txt} exposure over {days} days. Antibiotic daily counts are scaled to the CRP axis "
+                f"(max CRP≈{crp_peak:.1f} mg/L; max daily doses={max_dose}). In effective therapy, CRP typically begins to "
+                f"decline about **48–72 h after starting treatment**; look for a downward CRP trend **lagging** the days with dosing."
+            )
+
+            chart_title = f"CRP vs {abx_name}" if abx_name else "CRP vs Antibiotics"
+            chart = {"type": "line", "x": "date", "y": "value", "group": "group", "title": chart_title}
+
+            return {
+                "chart": chart,
+                "timeseries": rows,
+                "explanation": explanation,
+                "metric": "CRP vs Antibiotics",
+                "source": "synthetic" if is_synth else "fhir",
+            }
+
+
+
         # ---- LOINC map + units + synthetic defaults (self-contained) ----
         LOINC = {
             "crp":        {"codes": ["1988-5", "30522-7"], "title": "CRP",        "unit": "mg/L",  "synth": {"start": 7.5, "drift": -0.05, "noise": 0.4}},
@@ -1322,9 +1526,6 @@ def patient_chat(req: PatientChatRequest):
         return {"answer": f"Something went wrong while processing the request: {e}"}
 
 
-from utils import fhir_get  # at top, if not already
-
-
 @app.get("/fhir_ping")
 def fhir_ping(session_id: Optional[str] = None):
     try:
@@ -1357,6 +1558,30 @@ def _parse_days_back(text: str, default: int = 7) -> int:
         return default
     n = int(m.group(1))
     return n * 7 if m.group(2).startswith("w") else n
+
+_ABX_CANON = [
+    "ceftriaxone", "piperacillin/tazobactam", "piperacillin tazobactam", "pip/tazo",
+    "meropenem", "imipenem", "ertapenem",
+    "amoxicillin", "amoxiclav", "augmentin",
+    "vancomycin", "linezolid",
+    "ciprofloxacin", "levofloxacin", "moxifloxacin",
+    "doxycycline", "clindamycin", "metronidazole",
+    "gentamicin", "amikacin", "trimethoprim", "sulfamethoxazole", "cotrimoxazole"
+]
+
+def _extract_abx_name(text: str) -> str | None:
+    t = (text or "").lower()
+    for n in _ABX_CANON:
+        if n in t:
+            return n
+    # soft fallback: catch “ceftriax”, “pip/tazo”, “vanco”, etc.
+    soft = ["ceftri", "pip/tazo", "piptazo", "vanco", "clinda", "metro", "levo", "cipro", "mero"]
+    for n in soft:
+        if n in t:
+            return n
+    return None
+
+
 
 def _obs_series_for(patient_id: str, loinc_keys: list[str], days_back: int, session_id: str | None = None) -> list[dict]:
     from .utils import fetch_observations_by_code

@@ -272,6 +272,188 @@ def fetch_medications(
     return []
 
 
+# --- Antibiotics per day (simple keyword match + Medication* timestamps) ---
+def antibiotic_doses_per_day(
+    patient_id: str,
+    days_back: int,
+    access_token: str | None = None,
+    synth_if_empty: bool = True,
+    filter_names: list[str] | None = None,   # << NEW
+) -> list[dict]:
+    """
+    Return daily antibiotic exposure counts for the last N days:
+      [{"date":"YYYY-MM-DD","value":<doses/day>}, ...]
+    Looks in MedicationAdministration, MedicationRequest, MedicationStatement.
+    Detects antibiotics via ATC J01 codes OR name keywords.
+    If filter_names is provided (e.g., ["ceftriaxone"]), only count matching antibiotics.
+    Expands effective periods into 1/day across the covered date range.
+    """
+    import datetime as dt
+    from collections import Counter
+
+    # ---- window ----
+    today = dt.date.today()
+    start_date = today - dt.timedelta(days=days_back)
+
+    # Normalize provided filter names to lowercase tokens
+    filter_tokens = []
+    if filter_names:
+        for n in filter_names:
+            t = (n or "").lower().strip()
+            if t:
+                filter_tokens.append(t)
+
+    # ---- antibiotic detection helpers ----
+    abx_keywords = (
+        # β-lactams & others (broad and brand/common fragments)
+        "antibi", "cef", "ceph", "cefaz", "ceftri", "ceftriax", "ceftaz", "cefep",
+        "amox", "augmentin", "amoxiclav", "amoxicillin",
+        "penicillin", "piperacillin", "tazobactam", "pip/tazo", "tazo",
+        "meropenem", "imipenem", "ertapenem", "carbapenem",
+        "cipro", "ciproflox", "levofloxacin", "moxifloxacin", "ofloxacin", "quinolone",
+        "azithro", "clarithro", "erythro", "macrolide",
+        "doxy", "doxycycline", "tetracycline",
+        "clinda", "clindamycin",
+        "metronidazole", "flagyl",
+        "vanco", "vancomycin",
+        "linezolid", "zyvox",
+        "gentamicin", "amikacin", "tobramycin", "aminoglycoside",
+        "trimethoprim", "sulfamethoxazole", "co-trim", "cotrimoxazole", "tmp/smx"
+    )
+
+    def _is_abx_code(coding: dict) -> bool:
+        sys = (coding.get("system") or "").lower()
+        code = (coding.get("code") or "").upper()
+        # ATC J01 = antibacterials for systemic use
+        return ("whocc" in sys or "atc" in sys) and code.startswith("J01")
+
+    def _name_from_cc(cc: dict) -> str:
+        if not isinstance(cc, dict):
+            return ""
+        txt = (cc.get("text") or "").strip()
+        if txt:
+            return txt
+        for cd in cc.get("coding", []) or []:
+            disp = (cd.get("display") or "").strip()
+            if disp:
+                return disp
+        return ""
+
+    def _is_abx_by_name(name: str) -> bool:
+        s = (name or "").lower()
+        return "antibi" in s or any(k in s for k in abx_keywords)
+
+    def _match_filter(name: str) -> bool:
+        if not filter_tokens:
+            return True
+        s = (name or "").lower()
+        return any(tok in s for tok in filter_tokens)
+
+    def _antibiotic_resource(res: dict) -> tuple[bool, str]:
+        """Return (is_abx, display_name) and honor filter_names if provided."""
+        cc = res.get("medicationCodeableConcept")
+        nm = _name_from_cc(cc) if cc else ""
+        # code-based detection
+        for cd in (cc.get("coding", []) if isinstance(cc, dict) else []) or []:
+            if _is_abx_code(cd):
+                return (_match_filter(nm), nm if nm else (cd.get("display") or cd.get("code") or "antibiotic"))
+        # name-based detection
+        if _is_abx_by_name(nm):
+            return (_match_filter(nm), nm)
+        # fallback: sometimes resource has `code`
+        for cd in (res.get("code", {}) or {}).get("coding", []) or []:
+            if _is_abx_code(cd):
+                disp = cd.get("display") or cd.get("code") or "antibiotic"
+                return (_match_filter(disp), disp)
+        return (False, "")
+
+    meds = fetch_medications(patient_id, days_back=days_back, access_token=access_token)
+
+    # ---- collect daily counts ----
+    per_day = Counter()
+
+    def _date(s: str | None):
+        import datetime as dt
+        return dt.date.fromisoformat(s[:10]) if s else None
+
+    def _clamp(d):
+        if d is None:
+            return None
+        if d < start_date:
+            return start_date
+        if d > today:
+            return today
+        return d
+
+    def _add_range(d0, d1):
+        if d0 is None:
+            return
+        d0 = _clamp(d0)
+        d1 = _clamp(d1 or d0)
+        if d1 < d0:
+            return
+        # guard: very long spans are likely errors
+        if (d1 - d0).days > 120:
+            return
+        cur = d0
+        while cur <= d1:
+            per_day[cur] += 1
+            cur = cur + dt.timedelta(days=1)
+
+    matched_any = False
+
+    for m in meds:
+        try:
+            ok, dispname = _antibiotic_resource(m)
+            if not ok:
+                continue
+            matched_any = True
+
+            # Timestamps from different resource flavors
+            effP = m.get("effectivePeriod") or {}
+            eff_dt = m.get("effectiveDateTime")
+            authored = m.get("authoredOn")
+            di = (m.get("dosageInstruction") or [])
+            boundsP = (((di[0] or {}).get("timing") or {}).get("repeat") or {}).get("boundsPeriod", {}) if di else {}
+            stmtP = (m.get("effectivePeriod") or {})
+            stmt_dt = m.get("effectiveDateTime")
+
+            # prefer periods first
+            for s, e in [
+                (effP.get("start"), effP.get("end")),
+                (boundsP.get("start"), boundsP.get("end")),
+                (stmtP.get("start"), stmtP.get("end")),
+            ]:
+                if s:
+                    _add_range(_date(s), _date(e) or _date(s))
+                    break
+            else:
+                # single-day event
+                for one in (eff_dt, authored, stmt_dt):
+                    if one:
+                        d = _date(one)
+                        if d and start_date <= d <= today:
+                            per_day[d] += 1
+                            break
+        except Exception:
+            continue
+
+    out = []
+    for i in range(days_back, -1, -1):
+        d = today - dt.timedelta(days=i)
+        out.append({"date": d.isoformat(), "value": int(per_day.get(d, 0))})
+
+    if synth_if_empty and all(p["value"] == 0 for p in out):
+        # small 3-day synthetic course ending 5 days ago to keep the demo illustrative
+        for k in range(7, 4, -1):
+            idx = days_back - k
+            if 0 <= idx < len(out):
+                out[idx]["value"] = 1
+
+    return out
+
+
+
 
 
 # --- Add to utils.py (near other FHIR helpers) ---
