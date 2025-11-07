@@ -12,9 +12,9 @@ ALLOWED_TABLES=data,labs,patients,encounters
 BEDROCK_ENABLED=true
 BEDROCK_REGION=us-west-2
 
-BEDROCK_LITE_MODEL_ID=anthropic.claude-sonnet-4-5-20250929-v1:0
-BEDROCK_PRO_MODEL_ID=anthropic.claude-sonnet-4-5-20250929-v1:0
-BEDROCK_MODEL_ID=anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_LITE_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_PRO_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
 
 
 NLQ_FORCE_PRO=true         

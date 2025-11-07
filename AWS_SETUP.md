@@ -134,10 +134,20 @@ The following environment variables in `.env.local` control Bedrock:
 ```bash
 BEDROCK_ENABLED=true
 BEDROCK_REGION=us-west-2
-BEDROCK_MODEL_ID=anthropic.claude-sonnet-4-5-20250929-v1:0
-BEDROCK_LITE_MODEL_ID=anthropic.claude-sonnet-4-5-20250929-v1:0
-BEDROCK_PRO_MODEL_ID=anthropic.claude-sonnet-4-5-20250929-v1:0
+
+# Use inference profile IDs (required for Claude Sonnet 4.5)
+BEDROCK_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_LITE_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
+BEDROCK_PRO_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0
 ```
+
+**Important**: Claude Sonnet 4.5 requires using **inference profile IDs** (prefix `us.` or `eu.`) instead of direct model IDs. If you see the error:
+
+```
+ValidationException: Invocation of model ID with on-demand throughput isn't supported
+```
+
+This means you need to update your model IDs to use the inference profile format (`us.anthropic.claude-sonnet-4-5-20250929-v1:0` instead of `anthropic.claude-sonnet-4-5-20250929-v1:0`).
 
 ## Troubleshooting
 
