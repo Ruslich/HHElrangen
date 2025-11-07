@@ -108,8 +108,8 @@ def _pick_sql_model_id() -> str:
     - Else: start with Lite for simple intents, escalate on failure
     """
     use_pro = os.getenv("NLQ_FORCE_PRO", "true").lower() == "true"
-    return os.getenv("BEDROCK_PRO_MODEL_ID", "amazon.nova-pro-v1:0") if use_pro \
-           else os.getenv("BEDROCK_LITE_MODEL_ID", "amazon.nova-lite-v1:0")
+    return os.getenv("BEDROCK_PRO_MODEL_ID", "anthropic.claude-3-sonnet-20240229-v1:0") if use_pro \
+           else os.getenv("BEDROCK_LITE_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
 def _bedrock_converse(model_id: str, system_text: str, user_text: str,
                       max_tokens: int | None = None, temperature: float | None = None) -> str:
@@ -223,7 +223,7 @@ def _plan_with_bedrock(text: str, defaults: dict) -> dict:
         import boto3
         from botocore.config import Config
 
-        model_id   = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
+        model_id   = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
         max_tokens = int(os.getenv("BEDROCK_MAX_OUTPUT_TOKENS", "180"))
         temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0.2"))
         retries     = int(os.getenv("BEDROCK_RETRIES", "1"))
@@ -312,7 +312,7 @@ def _summarize_with_bedrock(summary_inputs: dict, force_off: bool = False) -> st
                 ]
             return d
 
-        model_id   = os.getenv("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0")
+        model_id   = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
         max_tokens = int(os.getenv("BEDROCK_MAX_OUTPUT_TOKENS", "140"))
         temperature = float(os.getenv("BEDROCK_TEMPERATURE", "0.2"))
         retries     = int(os.getenv("BEDROCK_RETRIES", "1"))
@@ -938,7 +938,7 @@ def _smalltalk_reply(text: str, history: list[dict]) -> str:
         msgs.append({"role": "user", "content": [{"text": text}]})
 
         resp = brt.converse(
-            modelId=os.getenv("BEDROCK_LITE_MODEL_ID", "amazon.nova-lite-v1:0"),
+            modelId=os.getenv("BEDROCK_LITE_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"),
             system=[{"text": "You are a friendly, concise assistant. Keep replies under two sentences."}],
             messages=msgs,
             inferenceConfig={"maxTokens": 120, "temperature": 0.5},
