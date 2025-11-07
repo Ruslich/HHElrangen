@@ -586,50 +586,37 @@ if res:
 # st.caption(f"Backend: {BACKEND}")
 
 # ============================================================================
-# CarePilot Widget Integration - FIXED VERSION
+# CarePilot Widget - Inject directly into Streamlit's HTML
 # ============================================================================
-import streamlit.components.v1 as components
 import pathlib
 
 # Get patient info
 patient_id = st.session_state.get("selected_patient_id", "DEMO-CRP-001")
 patient_name = st.session_state.get("selected_patient_name", "Unknown Patient")
 
-# Read widget files directly
+# Path to widget files  
 widget_dir = pathlib.Path(__file__).parent.parent / "carepilot-embed" / "dist"
+widget_js_path = widget_dir / "widget.iife.js"
+widget_css_path = widget_dir / "widget.css"
 
-try:
-    widget_js = (widget_dir / "widget.iife.js").read_text(encoding='utf-8')
-    widget_css = (widget_dir / "widget.css").read_text(encoding='utf-8')
-    
-    # Embed widget with proper escaping and parent frame access
-    widget_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <style>{widget_css}</style>
-</head>
-<body style="margin: 0; padding: 0; overflow: visible;">
-    <div id="carepilot-root"></div>
+if widget_js_path.exists() and widget_css_path.exists():
+    # Inject CSS and JS directly into the page using markdown with unsafe HTML
+    st.markdown(f"""
+    <link rel="stylesheet" href="/app/static/widget.css">
+    <div id="carepilot-root" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 999999;">
+        <!-- CarePilot will mount here -->
+    </div>
+    <script src="/app/static/widget.iife.js"></script>
     <script>
-    {widget_js}
-    
-    // Initialize immediately
     (function() {{
-        console.log('[CarePilot] Starting initialization...');
-        console.log('[CarePilot] Window object:', typeof window);
-        console.log('[CarePilot] CarePilot available:', typeof window.CarePilot);
-        
+        console.log('[CarePilot] Direct injection - Starting...');
         let attempts = 0;
-        const maxAttempts = 50;
         
-        function init() {{
+        function initWidget() {{
             attempts++;
-            console.log('[CarePilot] Init attempt', attempts);
-            
-            if (typeof window.CarePilot !== 'undefined' && window.CarePilot.init) {{
+            if (window.CarePilot && typeof window.CarePilot.init === 'function') {{
                 try {{
-                    console.log('[CarePilot] Initializing widget...');
+                    console.log('[CarePilot] Initializing with patient:', '{patient_id}');
                     window.CarePilot.init({{
                         apiUrl: '{BACKEND}',
                         patientId: '{patient_id}',
@@ -637,28 +624,26 @@ try:
                         department: 'Intensivstation',
                         useVerticalTab: false
                     }});
-                    console.log('[CarePilot] ✅ Widget initialized successfully!');
-                }} catch (error) {{
-                    console.error('[CarePilot] ❌ Initialization error:', error);
+                    console.log('[CarePilot] ✅ SUCCESS!');
+                }} catch (e) {{
+                    console.error('[CarePilot] Init error:', e);
                 }}
-            }} else if (attempts < maxAttempts) {{
-                console.log('[CarePilot] Not ready yet, retrying...');
-                setTimeout(init, 100);
+            }} else if (attempts < 100) {{
+                setTimeout(initWidget, 50);
             }} else {{
-                console.error('[CarePilot] ❌ Failed to initialize after', maxAttempts, 'attempts');
+                console.error('[CarePilot] Failed after 100 attempts');
             }}
         }}
         
-        // Start init process
-        setTimeout(init, 100);
+        if (document.readyState === 'loading') {{
+            document.addEventListener('DOMContentLoaded', () => setTimeout(initWidget, 200));
+        }} else {{
+            setTimeout(initWidget, 200);
+        }}
     }})();
     </script>
-</body>
-</html>
-"""
+    """, unsafe_allow_html=True)
     
-    # Render the component with sufficient height to show the floating button
-    components.html(widget_html, height=800, scrolling=False)
-    
-except Exception as e:
-    st.error(f"Failed to load CarePilot widget: {{e}}")
+    st.write("")  # Force Streamlit to render the above
+else:
+    st.error("⚠️ CarePilot widget files not found!")
