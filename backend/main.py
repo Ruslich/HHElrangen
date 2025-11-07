@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel  # noqa: E402
 
-from .utils import (  # noqa: E402
+from utils import (  # noqa: E402
     athena_sql_to_df,
     fetch_medications,
     fhir_or_synth_observations,
@@ -1099,7 +1099,7 @@ def patient_chat(req: PatientChatRequest):
         return {"answer": f"Something went wrong while processing the request: {e}"}
 
 
-from .utils import fhir_get  # at top, if not already
+from utils import fhir_get  # at top, if not already
 
 
 @app.get("/fhir_ping")
@@ -1146,7 +1146,7 @@ def _parse_days_back(text: str, default: int = 7) -> int:
     return n * 7 if m.group(2).startswith("w") else n
 
 def _obs_series_for(patient_id: str, loinc_keys: list[str], days_back: int) -> list[dict]:
-    from .utils import fetch_observations_by_code
+    from utils import fetch_observations_by_code
     # expand keys like ["crp"] → codes list
     codes = []
     for k in loinc_keys:
@@ -1198,6 +1198,6 @@ def find_demo_patient(code: str = "1988-5"):
     """
     Try to find a patient with this LOINC code present.
     """
-    from .utils import find_any_patient_with_observation
+    from utils import find_any_patient_with_observation
     pid = find_any_patient_with_observation(code)
     return {"patient_id": pid, "code": code}
