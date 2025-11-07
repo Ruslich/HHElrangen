@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel  # noqa: E402
 
-from .utils import (  # noqa: E402
+from utils import (  # noqa: E402
     athena_sql_to_df,
     fetch_medications,
     fhir_get,
