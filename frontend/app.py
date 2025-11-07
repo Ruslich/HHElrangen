@@ -13,6 +13,17 @@ st.set_page_config(page_title="Health Chat MVP", layout="wide")
 
 import uuid
 
+# --- Demo HIS config (left panel) ---
+DEMO_HIS_MODE = True  # flip to False if you want the old layout
+
+# A tiny synthetic roster you control for the pitch
+DEMO_PATIENTS = [
+    {"id": "DEMO-CRP-001", "name": "Anna Schmidt (ICU)"},
+    {"id": "DEMO-CRP-002", "name": "Jonny Kramer (Ward)"},
+    {"id": "DEMO-CRP-003", "name": "Karla Núñez (Surg)"},
+]
+
+
 # Parse query params for SMART-like demo launch
 params = st.query_params
 if "patient_id" in params and params.get("patient_id"):
@@ -37,26 +48,57 @@ st.sidebar.button("Reset chat", on_click=lambda: (
 BACKEND = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 # ------------- Sidebar: data picking -------------
-st.sidebar.title("Data")
+# st.sidebar.title("Data")
 
-if st.sidebar.button("List datasets"):
-    r = requests.get(f"{BACKEND}/datasets", timeout=30)
-    st.session_state["datasets"] = r.json().get("keys", [])
+# if st.sidebar.button("List datasets"):
+#     r = requests.get(f"{BACKEND}/datasets", timeout=30)
+#     st.session_state["datasets"] = r.json().get("keys", [])
 
-datasets = st.session_state.get("datasets", [])
-key = st.sidebar.selectbox("Select CSV key", datasets) if datasets else st.sidebar.text_input("Enter CSV key")
+# datasets = st.session_state.get("datasets", [])
+# key = st.sidebar.selectbox("Select CSV key", datasets) if datasets else st.sidebar.text_input("Enter CSV key")
 
-if key:
-    if st.sidebar.button("Preview head"):
-        r = requests.get(f"{BACKEND}/head", params={"key": key, "n": 20}, timeout=60)
-        if r.ok:
-            st.sidebar.write("Columns:")
-            cols = r.json().get("columns", [])
-            st.session_state["columns"] = cols
-            st.sidebar.json(cols)
-            st.sidebar.dataframe(pd.DataFrame(r.json().get("rows", [])))
-        else:
-            st.sidebar.error(f"Head failed: {r.text}")
+# if key:
+#     if st.sidebar.button("Preview head"):
+#         r = requests.get(f"{BACKEND}/head", params={"key": key, "n": 20}, timeout=60)
+#         if r.ok:
+#             st.sidebar.write("Columns:")
+#             cols = r.json().get("columns", [])
+#             st.session_state["columns"] = cols
+#             st.sidebar.json(cols)
+#             st.sidebar.dataframe(pd.DataFrame(r.json().get("rows", [])))
+#         else:
+#             st.sidebar.error(f"Head failed: {r.text}")
+
+
+# ------------- LEFT: Demo HIS (patient selector) -------------
+st.sidebar.title("Demo HIS")
+
+if DEMO_HIS_MODE:
+    # Doctor "chooses" the patient here, like inside the EHR
+    names = [p["name"] for p in DEMO_PATIENTS]
+    idx = st.sidebar.selectbox("Select patient", options=list(range(len(names))), format_func=lambda i: names[i])
+    selected_patient = DEMO_PATIENTS[idx]
+    st.session_state["selected_patient_id"] = selected_patient["id"]
+    st.session_state["selected_patient_name"] = selected_patient["name"]
+
+    st.sidebar.caption(f"Selected: **{selected_patient['name']}**  \nID: `{selected_patient['id']}`")
+
+    # Quick action buttons (optional)
+    col1, col2, col3 = st.sidebar.columns(3)
+    if col1.button("CRP 7d"):
+        st.session_state["patient_quick"] = "Show CRP last 7 days"
+    if col2.button("Creat 30d"):
+        st.session_state["patient_quick"] = "Show creatinine last 30 days"
+    if col3.button("Meds 7d"):
+        st.session_state["patient_quick"] = "Recent antibiotics"
+
+    st.sidebar.divider()
+    patient_mode = st.sidebar.toggle("Ask about selected patient", value=True, help="If on, the chat on the right will query FHIR/synthetic for this patient.")
+    st.session_state["patient_mode"] = patient_mode
+
+else:
+    st.sidebar.info("Demo HIS mode is off.")
+
 
 # ------------- Main: Chat-first UI -------------
 st.title("Healthcare Helper")
@@ -220,111 +262,127 @@ def render_chart(chart, rows, question: str | None = None):
     st.dataframe(df)
 
 
-prompt = st.chat_input("Ask me about your data (e.g., 'Which blood type is most frequent for males?')")
+# ------------- RIGHT: Chat box (routes to /patient_chat when patient mode is on) -------------
+# If a quick action was pressed on the left, use that as the next prompt
+queued = st.session_state.pop("patient_quick", None)
+prompt = queued or st.chat_input("Ask me about your data (e.g., 'Which blood type is most frequent for males?')")
+
 if prompt:
+    # show user bubble + store
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
+    # Decide patient vs population mode
+    patient_mode = bool(st.session_state.get("patient_mode"))
+    sel_pid = st.session_state.get("selected_patient_id")  # set by the Demo HIS dropdown
+
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             try:
-                history = st.session_state.messages[-6:]  # keep it cheap
-                payload = {
-                    "text": prompt,
-                    "history": history,                 # <— NEW
-                    "session_id": st.session_state.session_id,  # <— NEW
-                    "context": {
-                        "last_sql": st.session_state.get("last_sql"),
-                        "columns": st.session_state.get("columns"),
-                    },
-                }
+                if DEMO_HIS_MODE and patient_mode and sel_pid:
+                    # -------- Patient mode: call /patient_chat --------
+                    payload = {"patient_id": sel_pid, "text": prompt, "days_back": 30}
+                    r = requests.post(f"{BACKEND}/patient_chat", json=payload, timeout=60)
+                    if not r.ok:
+                        try:
+                            st.error(r.json().get("detail", r.text))
+                        except Exception:
+                            st.error(r.text)
+                        j = {"answer": r.text}
+                    else:
+                        j = r.json()
 
-                r = requests.post(f"{BACKEND}/chat", json=payload, timeout=120)
-                if not r.ok:
-                    try:
-                        st.error(r.json().get("detail", r.text))
-                    except Exception:
-                        st.error(r.text)
-                    st.stop()
-
-                j = r.json()
-
-                # If backend chose small talk, just show the text
-                if "text" in j and "sql" not in j:
-                    st.markdown(j["text"])
+                    # Render patient response
+                    if "timeseries" in j or "chart" in j:
+                        st.subheader("Patient chart")
+                        render_chart(j.get("chart", {"type": "table"}), j.get("timeseries", []), j.get("metric"))
+                        if j.get("explanation"):
+                            st.write("**Explanation:** ", j["explanation"])
+                        assistant_msg = j.get("explanation") or "See the chart above."
+                    elif "rows" in j:
+                        st.subheader("Patient data")
+                        st.dataframe(pd.DataFrame(j["rows"]))
+                        if j.get("explanation"):
+                            st.write("**Summary:** ", j["explanation"])
+                        assistant_msg = j.get("explanation") or "See the table above."
+                    else:
+                        st.write(j.get("answer", "No answer."))
+                        assistant_msg = j.get("answer", "No answer.")
                 else:
-                    # Otherwise, we got an analytics result from NLQ
-                    st.markdown("**SQL**")
-                    st.code(j.get("sql", ""), language="sql")
-                    render_chart(j.get("chart", {}), j.get("rows", []), prompt)
-                    st.markdown(f"**Summary:** {j.get('summary', '')}")
-                    # after rendering the analytics result:
-                    st.session_state.last_sql = j.get("sql")
-                    st.session_state.columns = j.get("columns")
+                    # -------- Population mode: call /chat (your existing analytics path) --------
+                    history = st.session_state.messages[-6:]  # keep it cheap
+                    payload = {
+                        "text": prompt,
+                        "history": history,
+                        "session_id": st.session_state.session_id,
+                        "context": {
+                            "last_sql": st.session_state.get("last_sql"),
+                            "columns": st.session_state.get("columns"),
+                        },
+                    }
 
-                    # ---- Debug (model + rewrite) ----
-                    # if "model_used" in j or "medication_rewrite" in j:
-                    #     colA, colB = st.columns(2)
-                    #     with colA:
-                    #         st.caption("Model used")
-                    #         st.code(str(j.get("model_used", "(unknown)")))
-                    #     with colB:
-                    #         st.caption("Medication rewrite applied")
-                    #         st.code("Yes ✅" if j.get("medication_rewrite") else "No ❌")
+                    r = requests.post(f"{BACKEND}/chat", json=payload, timeout=120)
+                    if not r.ok:
+                        try:
+                            st.error(r.json().get("detail", r.text))
+                        except Exception:
+                            st.error(r.text)
+                        j = {"text": r.text}
+                    else:
+                        j = r.json()
 
-                    #     with st.expander("Raw payload (debug)", expanded=False):
-                    #         st.json({
-                    #             "model_used": j.get("model_used"),
-                    #             "medication_rewrite": j.get("medication_rewrite"),
-                    #             "columns": j.get("columns"),
-                    #             "row_count": len(j.get("rows", []))
-                    #         })
-
+                    if "text" in j and "sql" not in j:
+                        st.markdown(j["text"])
+                        assistant_msg = j["text"]
+                    else:
+                        st.markdown("**SQL**")
+                        st.code(j.get("sql", ""), language="sql")
+                        render_chart(j.get("chart", {}), j.get("rows", []), prompt)
+                        st.markdown(f"**Summary:** {j.get('summary', '')}")
+                        st.session_state.last_sql = j.get("sql")
+                        st.session_state.columns = j.get("columns")
+                        assistant_msg = j.get("summary") or "See the chart and SQL above."
             except Exception as e:
                 st.error(f"Oops: {e}")
-    # after you parse j = r.json()
-    if "text" in j and "sql" not in j:
-        # small-talk response
-        assistant_msg = j["text"]
-    else:
-        # analytics response – keep something meaningful for the transcript
-        assistant_msg = j.get("summary") or "See the chart and SQL above."
+                assistant_msg = f"Oops: {e}"
 
+    # append assistant message to transcript
     st.session_state.messages.append({"role": "assistant", "content": assistant_msg})
 
 
+
 # ------------- Sidebar: patient (FHIR) -------------
-st.sidebar.title("Patient (FHIR)")
-pat_ping = st.sidebar.button("Ping FHIR (list 3 patients)")
-if pat_ping:
-    r = requests.get(f"{BACKEND}/fhir_ping", timeout=30)
-    if r.ok:
-        st.session_state["fhir_ping"] = r.json()
-    else:
-        st.sidebar.error(r.text)
+# st.sidebar.title("Patient (FHIR)")
+# pat_ping = st.sidebar.button("Ping FHIR (list 3 patients)")
+# if pat_ping:
+#     r = requests.get(f"{BACKEND}/fhir_ping", timeout=30)
+#     if r.ok:
+#         st.session_state["fhir_ping"] = r.json()
+#     else:
+#         st.sidebar.error(r.text)
 
-ping = st.session_state.get("fhir_ping")
-patients = []
-if ping:
-    patients = ping.get("patients", [])
-    st.sidebar.caption(f"Server: {ping.get('base_url')}")
-    for p in patients:
-        st.sidebar.write(f"• {p.get('id')} – {p.get('name')}")
+# ping = st.session_state.get("fhir_ping")
+# patients = []
+# if ping:
+#     patients = ping.get("patients", [])
+#     st.sidebar.caption(f"Server: {ping.get('base_url')}")
+#     for p in patients:
+#         st.sidebar.write(f"• {p.get('id')} – {p.get('name')}")
 
-patient_id = st.sidebar.text_input(
-    "Patient ID",
-    value=st.session_state.get("launched_patient_id") or (patients[0]["id"] if patients else "")
-)
-days_back = st.sidebar.slider("Days back", 1, 365, 7)
+# patient_id = st.sidebar.text_input(
+#     "Patient ID",
+#     value=st.session_state.get("launched_patient_id") or (patients[0]["id"] if patients else "")
+# )
+# days_back = st.sidebar.slider("Days back", 1, 365, 7)
 
-st.sidebar.divider()
-st.sidebar.caption("Ask the patient assistant:")
-pat_q = st.sidebar.text_input("e.g., Show CRP last 7 days")
-if st.sidebar.button("Run patient query") and patient_id and pat_q:
-    with st.spinner("Querying FHIR..."):
-        r = requests.post(f"{BACKEND}/patient_chat", json={"patient_id": patient_id, "text": pat_q, "days_back": days_back}, timeout=60)
-        st.session_state["patient_result"] = r.json() if r.ok else {"error": r.text}
+# st.sidebar.divider()
+# st.sidebar.caption("Ask the patient assistant:")
+# pat_q = st.sidebar.text_input("e.g., Show CRP last 7 days")
+# if st.sidebar.button("Run patient query") and patient_id and pat_q:
+#     with st.spinner("Querying FHIR..."):
+#         r = requests.post(f"{BACKEND}/patient_chat", json={"patient_id": patient_id, "text": pat_q, "days_back": days_back}, timeout=60)
+#         st.session_state["patient_result"] = r.json() if r.ok else {"error": r.text}
 
 # ------------- Main: patient result (if any) -------------
 res = st.session_state.get("patient_result")
