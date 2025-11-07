@@ -1,0 +1,3 @@
+[submodule "carepilot-embed"]
+	path = carepilot-embed
+	url = https://github.com/denishotii/carepilot-embed.git
