@@ -584,3 +584,34 @@ if res:
 #             cdl2.download_button("Download slice CSV", csv2, file_name="slice.csv", mime="text/csv")
 
 # st.caption(f"Backend: {BACKEND}")
+
+# ============================================================================
+# CarePilot Widget Integration
+# ============================================================================
+# Embed the CarePilot chat widget on every page
+st.markdown("""
+<script src="../carepilot-embed/dist/widget.iife.js"></script>
+<link rel="stylesheet" href="../carepilot-embed/dist/widget.css">
+<div id="carepilot-root"></div>
+<script>
+  (function() {
+    if (window.CarePilot) {
+      const patientId = '%s';
+      const patientName = '%s';
+      const apiUrl = '%s';
+      
+      window.CarePilot.init({
+        apiUrl: apiUrl,
+        patientId: patientId,
+        patientName: patientName,
+        department: 'Intensivstation',
+        useVerticalTab: false
+      });
+    }
+  })();
+</script>
+""" % (
+    st.session_state.get("selected_patient_id", ""),
+    st.session_state.get("selected_patient_name", ""),
+    BACKEND
+), unsafe_allow_html=True)
