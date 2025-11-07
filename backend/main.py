@@ -11,10 +11,13 @@ from typing import Optional  # noqa: E402
 from cachetools import TTLCache
 from fastapi import Body, FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel  # noqa: E402
 
 from .utils import (  # noqa: E402
     athena_sql_to_df,
+    fetch_medications,
+    fhir_or_synth_observations,
     get_table_summaries,
     is_sql_safe,
     list_keys,
@@ -34,6 +37,10 @@ app.add_middleware(
 
 BUCKET = os.getenv("DATA_BUCKET", "health-demo-hherlangen")
 PREFIX = os.getenv("DATA_PREFIX", "data/")
+
+# FHIR base URL used by the FHIR helper; configurable via environment.
+# Try FHIR_BASE_URL first, then a legacy FHIR_BASE, else default to localhost.
+FHIR_BASE_URL = os.getenv("FHIR_BASE_URL", os.getenv("FHIR_BASE", "http://localhost:8080"))
 
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))  # 1 hour default
 SESSIONS = TTLCache(maxsize=500, ttl=SESSION_TTL)
@@ -55,6 +62,7 @@ def s3_demo():
     return {
         "head": df.head(5).to_dict(orient="records")
     }
+
 
 # --- New MVP endpoints ---
 
@@ -84,6 +92,11 @@ class AnalyzeRequest(BaseModel):
     limit: int = 6                    # top-N groups to show if grouped
     use_ai: Optional[bool] = None  # if provided, overrides BEDROCK_ENABLED for this request
 
+
+class PatientChatRequest(BaseModel):
+    patient_id: str
+    text: str
+    days_back: int = 7
 
 
 # --- Bedrock helpers (model selection, review/fix, limits) ---
@@ -967,3 +980,224 @@ def chat(req: ChatRequest):
     SESSIONS[sid] = session
     return {"text": reply}
 
+
+from collections import Counter
+
+
+@app.post("/patient_chat")
+def patient_chat(req: PatientChatRequest):
+    """
+    FHIR-backed patient assistant (hackathon router) with synthetic fallback.
+    Supports:
+      - "CRP ... last X days"
+      - "creatinine ... last X days"
+      - "glucose ... last X days"
+      - "recent medications / antibiotics"
+    Returns chart/table payloads your Streamlit app already renders.
+    """
+    try:
+        t = (req.text or "").lower()
+        days = _parse_days_back(req.text, req.days_back)
+
+        # ---- LOINC map + units + synthetic defaults (self-contained) ----
+        LOINC = {
+            "crp":        {"codes": ["1988-5", "30522-7"], "title": "CRP",        "unit": "mg/L",  "synth": {"start": 7.5, "drift": -0.05, "noise": 0.4}},
+            "creatinine": {"codes": ["2160-0"],            "title": "Creatinine", "unit": "mg/dL", "synth": {"start": 1.2, "drift":  0.00, "noise": 0.08}},
+            "glucose":    {"codes": ["2345-7", "2339-0"],  "title": "Glucose",    "unit": "mg/dL", "synth": {"start": 118, "drift":  0.10, "noise": 4.0}},
+        }
+
+        # ----- LAB INTENTS -----
+        for key, meta in LOINC.items():
+            if key in t or meta["title"].lower() in t:
+                # Try FHIR first; if empty or request fails, we synthesize a realistic series
+                points, is_synth = fhir_or_synth_observations(
+                    req.patient_id,
+                    meta["codes"],
+                    days,
+                    synth={"metric": meta["title"], "unit": meta["unit"], **meta["synth"]},
+                )
+
+                values = [p["value"] for p in points]
+                if not values:
+                    return {
+                        "answer": f"I couldn’t find any {meta['title']} results for this patient in the last {days} days.",
+                        "timeseries": [],
+                    }
+
+                first, last, peak = values[0], values[-1], max(values)
+                mean_val = sum(values) / len(values) if values else None
+                change_pct = (100.0 * (last - first) / first) if first else 0.0
+
+                # Prefer Bedrock; fall back to deterministic string if disabled/fails
+                summary_inputs = {
+                    "metric": meta["title"],
+                    "unit": meta["unit"],
+                    "timeseries": points,
+                    "first": first,
+                    "last": last,
+                    "peak": peak,
+                    "mean": mean_val,
+                    "change_pct": change_pct,
+                    "days": days,
+                    "source": "synthetic" if is_synth else "fhir",
+                }
+                try:
+                    explanation = _summarize_with_bedrock(summary_inputs)
+                except Exception:
+                    explanation = (
+                        f"{meta['title']} over {days} days "
+                        f"({'synthetic demo' if is_synth else 'FHIR'}): "
+                        f"first={first} {meta['unit']}, last={last} {meta['unit']}, "
+                        f"peak={peak} {meta['unit']}, mean≈{mean_val:.2f} {meta['unit']} "
+                        f"(Δ≈{change_pct:.1f}%)."
+                    )
+
+                chart = {
+                    "type": "line",
+                    "x": "date",
+                    "y": "value",
+                    "title": f"{meta['title']} over time",
+                    "meanLine": True,
+                    "yUnit": meta["unit"],
+                }
+
+                return {
+                    "chart": chart,
+                    "timeseries": points,
+                    "explanation": explanation,
+                    "metric": meta["title"],
+                    "source": "synthetic" if is_synth else "fhir",
+                }
+
+        # ----- MEDICATION / ANTIBIOTIC INTENT -----
+        if any(w in t for w in ["antibiotic", "antibiotics", "medication", "meds", "drugs"]):
+            meds = fetch_medications(req.patient_id, days_back=days)
+            rows = []
+            for m in meds:
+                med_code = m.get("medicationCodeableConcept", {})
+                text = med_code.get("text") or (med_code.get("coding", [{}])[0].get("display"))
+                when = m.get("effectiveDateTime") or m.get("effectivePeriod", {}).get("start")
+                rows.append({"medication": text or "Unknown", "when": (when or "")[:16]})
+
+            if not rows:
+                return {"answer": f"No recent medication administrations found (last {days} days).", "rows": []}
+
+            cnt = Counter(r["medication"] for r in rows)
+            explanation = "Recent meds (last " + str(days) + " days): " + "; ".join(f"{k}: {n}x" for k, n in cnt.most_common())
+
+            return {"rows": rows, "explanation": explanation}
+
+        # ----- FALLBACK -----
+        return {
+            "answer": "Try: “Show CRP last 7 days”, “Creatinine last 30 days”, “Glucose last 14 days”, or “Recent antibiotics.”"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # keep the API resilient for the demo
+        return {"answer": f"Something went wrong while processing the request: {e}"}
+
+
+from .utils import fhir_get  # at top, if not already
+
+
+@app.get("/fhir_ping")
+def fhir_ping():
+    """
+    Quick connectivity check to the configured FHIR server.
+    """
+    try:
+        bundle = fhir_get("Patient", params={"_count": 3})
+        entries = bundle.get("entry", []) or []
+        patients = []
+        for e in entries:
+            res = e.get("resource", {})
+            patients.append({
+                "id": res.get("id"),
+                "name": res.get("name"),
+                "gender": res.get("gender"),
+                "birthDate": res.get("birthDate"),
+            })
+        return {
+            "base_url": FHIR_BASE_URL,
+            "count": len(patients),
+            "patients": patients,
+        }
+    except Exception as e:
+        # You’ll see error text in your browser / curl
+        raise HTTPException(status_code=500, detail=f"FHIR ping failed: {e}")
+
+
+# --- Add in main.py, near other helpers ---
+
+Loinc = {
+    "crp": ["1988-5", "30522-7"],          # CRP mass concentration (serum) and alt
+    "creatinine": ["2160-0"],              # Creatinine [Mass/volume] in Serum/Plasma
+    "glucose": ["2345-7", "2339-0"],       # Glucose (serum/plasma / blood)
+}
+
+def _parse_days_back(text: str, default: int = 7) -> int:
+    import re
+    m = re.search(r"last\s+(\d+)\s*(day|days|d|week|weeks|w)", (text or "").lower())
+    if not m:
+        return default
+    n = int(m.group(1))
+    return n * 7 if m.group(2).startswith("w") else n
+
+def _obs_series_for(patient_id: str, loinc_keys: list[str], days_back: int) -> list[dict]:
+    from .utils import fetch_observations_by_code
+    # expand keys like ["crp"] → codes list
+    codes = []
+    for k in loinc_keys:
+        if k.lower() in Loinc:
+            codes.extend(Loinc[k.lower()])
+        else:
+            codes.append(k)
+    obs = fetch_observations_by_code(patient_id, codes, days_back)
+    pts = []
+    for o in obs:
+        # numeric value only
+        v = None
+        if "valueQuantity" in o:
+            v = o["valueQuantity"].get("value")
+        if v is None:
+            continue
+        eff = o.get("effectiveDateTime") or o.get("issued")
+        if not eff:
+            continue
+        pts.append({"date": eff[:10], "value": float(v)})
+    return sorted(pts, key=lambda p: p["date"])
+
+
+@app.get("/smart_demo")
+def smart_demo():
+    """
+    Tiny SMART-like launcher: lists 3 patients and gives Launch links.
+    """
+    try:
+        bundle = fhir_get("Patient", params={"_count": 3})
+        entries = bundle.get("entry", []) or []
+        html = ["<h2>Demo EHR Launcher</h2><ul>"]
+        for e in entries:
+            res = e.get("resource", {})
+            pid = res.get("id")
+            nm = res.get("name")
+            label = (nm[0].get("text") if nm else pid) or pid
+            # Streamlit runs at 8501 by default; pass patient id as a param
+            href = f"http://127.0.0.1:8501/?demo_launch=1&patient_id={pid}"
+            html.append(f'<li>{label} &nbsp; <a href="{href}" target="_blank">Launch app for this patient</a></li>')
+        html.append("</ul><p>Tip: change 127.0.0.1 if your app runs elsewhere.</p>")
+        return HTMLResponse("\n".join(html))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/find_demo_patient")
+def find_demo_patient(code: str = "1988-5"):
+    """
+    Try to find a patient with this LOINC code present.
+    """
+    from .utils import find_any_patient_with_observation
+    pid = find_any_patient_with_observation(code)
+    return {"patient_id": pid, "code": code}

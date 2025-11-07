@@ -13,6 +13,15 @@ st.set_page_config(page_title="Health Chat MVP", layout="wide")
 
 import uuid
 
+# Parse query params for SMART-like demo launch
+params = st.query_params
+if "patient_id" in params and params.get("patient_id"):
+    # seed the sidebar input on first load
+    st.session_state.setdefault("patient_result", None)
+    st.session_state.setdefault("messages", [])
+    st.session_state["launched_patient_id"] = params.get("patient_id")
+
+
 # Chat message store
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -283,6 +292,57 @@ if prompt:
         assistant_msg = j.get("summary") or "See the chart and SQL above."
 
     st.session_state.messages.append({"role": "assistant", "content": assistant_msg})
+
+
+# ------------- Sidebar: patient (FHIR) -------------
+st.sidebar.title("Patient (FHIR)")
+pat_ping = st.sidebar.button("Ping FHIR (list 3 patients)")
+if pat_ping:
+    r = requests.get(f"{BACKEND}/fhir_ping", timeout=30)
+    if r.ok:
+        st.session_state["fhir_ping"] = r.json()
+    else:
+        st.sidebar.error(r.text)
+
+ping = st.session_state.get("fhir_ping")
+patients = []
+if ping:
+    patients = ping.get("patients", [])
+    st.sidebar.caption(f"Server: {ping.get('base_url')}")
+    for p in patients:
+        st.sidebar.write(f"• {p.get('id')} – {p.get('name')}")
+
+patient_id = st.sidebar.text_input(
+    "Patient ID",
+    value=st.session_state.get("launched_patient_id") or (patients[0]["id"] if patients else "")
+)
+days_back = st.sidebar.slider("Days back", 1, 365, 7)
+
+st.sidebar.divider()
+st.sidebar.caption("Ask the patient assistant:")
+pat_q = st.sidebar.text_input("e.g., Show CRP last 7 days")
+if st.sidebar.button("Run patient query") and patient_id and pat_q:
+    with st.spinner("Querying FHIR..."):
+        r = requests.post(f"{BACKEND}/patient_chat", json={"patient_id": patient_id, "text": pat_q, "days_back": days_back}, timeout=60)
+        st.session_state["patient_result"] = r.json() if r.ok else {"error": r.text}
+
+# ------------- Main: patient result (if any) -------------
+res = st.session_state.get("patient_result")
+if res:
+    if "error" in res:
+        st.error(res["error"])
+    elif "timeseries" in res or "chart" in res:
+        st.subheader("Patient chart")
+        render_chart(res.get("chart", {"type": "table"}), res.get("timeseries", []), res.get("metric"))
+        if res.get("explanation"):
+            st.write("**Explanation:** ", res["explanation"])
+    elif "rows" in res:
+        st.subheader("Patient data")
+        st.dataframe(pd.DataFrame(res["rows"]))
+        if res.get("explanation"):
+            st.write("**Summary:** ", res["explanation"])
+    elif "answer" in res:
+        st.info(res["answer"])
 
 
 # ------------- Advanced controls (legacy form posting to /analyze) -------------

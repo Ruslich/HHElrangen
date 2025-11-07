@@ -1,7 +1,6 @@
 from dotenv import load_dotenv
 
 load_dotenv(".env.local"); load_dotenv()  # also loads .env if present
-
 import io
 import os
 import time
@@ -9,6 +8,7 @@ from typing import Dict, List, Tuple
 
 import boto3
 import pandas as pd
+import requests
 
 
 def read_csv_from_s3(bucket, key):
@@ -196,3 +196,157 @@ def suggest_chart(df: pd.DataFrame) -> Dict[str, str]:
     # fallback
     return {"type": "table"}
 
+
+FHIR_BASE_URL = os.getenv("FHIR_BASE_URL", "").rstrip("/")
+FHIR_AUTH_TOKEN = os.getenv("FHIR_AUTH_TOKEN", "")
+
+def fhir_get(path: str, params: dict | None = None) -> dict:
+    if not FHIR_BASE_URL:
+        raise RuntimeError("FHIR_BASE_URL not set")
+    headers = {"Accept": "application/fhir+json"}
+    if FHIR_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {FHIR_AUTH_TOKEN}"
+    url = f"{FHIR_BASE_URL}/{path.lstrip('/')}"
+    r = requests.get(url, headers=headers, params=params or {}, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def fetch_observations(patient_id: str, loinc_code: str | None = None, days_back: int = 7) -> list[dict]:
+    import datetime as dt
+
+    params = {
+        "patient": patient_id,
+        "_count": 200,
+    }
+    if loinc_code:
+        params["code"] = loinc_code
+    since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+    params["date"] = f"ge{since}"
+    bundle = fhir_get("Observation", params=params)
+    return [e["resource"] for e in bundle.get("entry", []) if "resource" in e]
+
+def fetch_medications(patient_id: str, days_back: int = 7) -> list[dict]:
+    import datetime as dt
+
+    since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+    params = {"patient": patient_id, "date": f"ge{since}", "_count": 200}
+    bundle = fhir_get("MedicationAdministration", params=params)
+    return [e["resource"] for e in bundle.get("entry", []) if "resource" in e]
+
+
+# --- Add to utils.py (near other FHIR helpers) ---
+
+# utils.py
+
+def _fhir_collect_all(path: str, params: dict) -> list[dict]:
+    """Follow _link.next to collect all bundle entries."""
+    import requests
+    out = []
+    # Ensure no accidental leading/trailing spaces in keys
+    clean = {str(k).strip(): v for k, v in params.items() if v is not None}
+    r = requests.get(
+        f"{FHIR_BASE_URL.rstrip('/')}/{path}",
+        params=clean,
+        headers={"Accept": "application/fhir+json"},
+        timeout=15,
+    )
+    r.raise_for_status()
+    bundle = r.json()
+
+    while True:
+        out.extend([e["resource"] for e in bundle.get("entry", []) if "resource" in e])
+
+        next_link = None
+        for l in bundle.get("link", []):
+            if l.get("relation") == "next":
+                next_link = l.get("url")
+                break
+        if not next_link:
+            break
+
+        r = requests.get(next_link, headers={"Accept": "application/fhir+json"}, timeout=15)
+        r.raise_for_status()
+        bundle = r.json()
+
+    return out
+
+
+def fetch_observations_by_code(patient_id: str, loinc_codes: list[str], days_back: int = 7) -> list[dict]:
+    """
+    Fetch Observations for the given LOINC code(s).
+    OR semantics via comma-separated token list: code=1988-5,30522-7
+    """
+    import datetime as dt
+    since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+    params = {
+        "patient": patient_id,
+        "date": f"ge{since}",
+        "_count": 200,
+        "code": ",".join(loinc_codes),  # <-- correct OR syntax
+    }
+    return _fhir_collect_all("Observation", params)
+
+
+
+def find_any_patient_with_observation(loinc_code: str, days_back: int = 365) -> str | None:
+    """
+    Try to discover a patient with this lab by scanning Observations and following _include=Observation:patient.
+    Returns a patient id or None (best-effort; public HAPI data is noisy).
+    """
+    import datetime as dt
+    since = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+    params = {"code": loinc_code, "date": f"ge{since}", "_count": 50, "_include": "Observation:patient"}
+    bundle = fhir_get("Observation", params=params)
+    pats = []
+    for e in bundle.get("entry", []):
+        res = e.get("resource", {})
+        if res.get("resourceType") == "Patient" and res.get("id"):
+            pats.append(res["id"])
+        if res.get("resourceType") == "Observation":
+            subj = (res.get("subject") or {}).get("reference", "")
+            if subj.startswith("Patient/"):
+                pats.append(subj.split("/",1)[1])
+    return pats[0] if pats else None
+
+
+# utils.py
+
+def synth_timeseries(days: int, start_value: float, drift: float = 0.0, noise: float = 0.2):
+    """Generate a simple daily timeseries for demos."""
+    import datetime as dt
+    import random
+    today = dt.date.today()
+    v = start_value
+    out = []
+    for i in range(days, -1, -1):
+        d = (today - dt.timedelta(days=i)).isoformat()
+        v = max(0.0, v + drift + random.uniform(-noise, noise))
+        out.append({"date": d, "value": round(v, 2)})
+    return out
+
+
+def fhir_or_synth_observations(patient_id: str, loinc_codes: list[str], days_back: int, synth: dict):
+    """
+    Try FHIR. If nothing (or request fails), return synthetic series.
+    'synth' = {"metric": "CRP", "unit": "mg/L", "start": 7.2, "drift": -0.1, "noise": 0.6}
+    """
+    try:
+        obs = fetch_observations_by_code(patient_id, loinc_codes, days_back)
+        pts = []
+        for o in obs:
+            vq = o.get("valueQuantity")
+            if not vq or vq.get("value") is None:
+                continue
+            eff = o.get("effectiveDateTime") or o.get("issued")
+            if not eff:
+                continue
+            pts.append({"date": eff[:10], "value": float(vq["value"])})
+        pts.sort(key=lambda p: p["date"])
+        if pts:
+            return pts, False  # from FHIR
+    except Exception:
+        pass
+
+    # synth fallback
+    pts = synth_timeseries(days_back, synth.get("start", 5.0), synth.get("drift", 0.0), synth.get("noise", 0.3))
+    return pts, True
