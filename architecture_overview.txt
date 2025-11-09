@@ -1,0 +1,61 @@
+## Architecture Summary
+Outcome: architecture overview for HHElrangen stack (2025-11-08)
+
+- Web widget `carepilot-embed` (React 18, Tailwind, Vite) runs inside the host EHR page and calls the FastAPI backend via HTTPS using `BACKEND_URL` from `_env.local`.
+- FastAPI app in `backend/main.py` exposes endpoints for NLQ, chat, dataset browsing, SMART mock auth, and PDF prefill, with session state cached in-memory via `TTLCache`.
+- Backend integrates Amazon Bedrock for NL→SQL generation and result summarization, Athena + Glue for querying structured data, and S3 for both dataset storage and Athena outputs.
+- PDF prefill module manages template scanning, auto-mapping (optional OpenAI API), PDF generation, and optional persistence to S3.
+- Environment variables (region, bucket, model IDs, FHIR URL) in `_env.local` drive deployment configuration targeting AWS `us-west-2`.
+
+## Components & Technologies
+Frontend (`carepilot-embed`):
+- React 18.2, ReactDOM 18.2
+- Tailwind CSS 3.4, Vite 5 build pipeline
+- Embedded via script tag; `VITE_API_URL` -> FastAPI backend
+
+Backend (`backend`):
+- FastAPI service with CORS enabled for localhost dev origins
+- Endpoints: `/hello`, `/avg`, `/s3demo`, `/datasets`, `/head`, `/nlq`, `/chat`, `/smart/mock_login`, `/smart/logout`, `/pdf/*`
+- Session management: `cachetools.TTLCache`
+
+Data & Analytics Layer:
+- Amazon S3 (`DATA_BUCKET=hhe-bucket-1`, `DATA_PREFIX=data/`) holds CSV datasets and Athena outputs (`ATHENA_OUTPUT=s3://hhe-bucket-1/athena-results/`)
+- AWS Glue Data Catalog provides schema metadata for Athena prompt grounding
+- Amazon Athena executes generated SQL (`ATHENA_DATABASE=health_db`, `ATHENA_WORKGROUP=primary`)
+- Athena queries limited to allowed tables (`ALLOWED_TABLES=data,labs,patients,encounters`)
+
+AI/LLM Services:
+- Amazon Bedrock enabled (`BEDROCK_ENABLED=true`) with Claude Sonnet 4.5 model IDs
+- `_bedrock_converse` helper used for SQL generation, repairs, summaries, and lightweight chat responses
+- Optional OpenAI API key supports automatic PDF field mapping
+
+Healthcare Integrations:
+- External FHIR server (`FHIR_BASE_URL=https://hapi.fhir.org/baseR4`) accessed via REST `requests` helpers for observations, medications, etc.
+- SMART-on-FHIR mock endpoints issue session IDs and store access tokens for subsequent FHIR calls
+
+PDF Automation:
+- `PDFPrefillService` handles template scanning, user overrides, auto-mapping, generation, caching
+- Optional S3 persistence (`PDF_PREFILL_S3_BUCKET`, `PDF_PREFILL_S3_PREFIX`) for generated PDFs
+
+Deployment & Configuration:
+- Environment controlled through `_env.local` (region, buckets, model IDs, token limits)
+- AWS region default `us-west-2`
+- CORS allows local dev origins (`http://localhost/127.0.0.1` ports 5173, 8501)
+
+Key Flows for Diagramming:
+1. Widget load → browser renders CarePilot sidebar, loads config (`apiUrl`, patient context).
+2. NLQ flow → widget → `/nlq` → Bedrock SQL → Athena/Glue/S3 → summarized response.
+3. Dataset exploration → `/datasets` & `/head` → S3 previews.
+4. Chat & context → `/chat` → FHIR helper data + Bedrock conversation.
+5. SMART mock login → session cache → subsequent FHIR calls reuse token.
+6. PDF automation → `/pdf/*` → template scan/auto map (OpenAI optional) → fill PDF → optional S3 store.
+
+AWS Services In Use:
+- Amazon S3
+- AWS Glue Data Catalog
+- Amazon Athena
+- Amazon Bedrock (Claude Sonnet 4.5 / Haiku)
+
+External Services:
+- Public FHIR endpoint (`https://hapi.fhir.org/baseR4`)
+- Optional OpenAI API for PDF auto-mapping support
